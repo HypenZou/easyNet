@@ -26,8 +26,6 @@ type Conn struct {
 	fd     int // file descriptor
 	rIndex int // read timer index
 	wIndex int // write timer index
-	nread  int // total read
-	nwrite int // total write
 
 	left      int      // left to send
 	writeList [][]byte // send queue
@@ -36,6 +34,8 @@ type Conn struct {
 	closeErr error // err on closed
 
 	remoteAddr net.Addr // remote addr
+
+	session interface{} // user session
 }
 
 // Fd return system file descriptor
@@ -58,14 +58,13 @@ func (c *Conn) Read(b []byte) (int, error) {
 	if c.g.onRead != nil {
 		return c.g.onRead(c, b)
 	}
-	n, err := syscall.Read(int(c.fd), b)
-	if n > 0 {
-		c.nread += n
-	}
-	return n, err
+
+	return syscall.Read(int(c.fd), b)
 }
 
 // Write implement net.Conn
+// IF return syscall.EINVAL, should Close
+// ELSE the data would be send or push to write list
 func (c *Conn) Write(b []byte) error {
 	c.mux.Lock()
 	defer c.mux.Unlock()
@@ -87,7 +86,6 @@ func (c *Conn) Write(b []byte) error {
 		for {
 			n, err = syscall.Write(int(c.fd), b)
 			if n > 0 {
-				c.nwrite += n
 				if n < len(b) {
 					b = b[n:]
 					c.writeList = append(c.writeList, b)
@@ -119,6 +117,8 @@ func (c *Conn) Write(b []byte) error {
 }
 
 // Writev wrap writevimplement and extend net.Conn
+// IF return syscall.EINVAL, should Close
+// ELSE the data would be send or push to write list
 func (c *Conn) Writev(in [][]byte) (int, error) {
 	c.mux.Lock()
 
@@ -143,17 +143,17 @@ func (c *Conn) Close() error {
 	return c.closeWithError(nil)
 }
 
-// LocalAddr implement net.Conn
+// LocalAddr return socket local addr
 func (c *Conn) LocalAddr() net.Addr {
 	return c.g.localAddr
 }
 
-// RemoteAddr implement net.Conn
+// RemoteAddr return socket remote addr
 func (c *Conn) RemoteAddr() net.Addr {
 	return c.remoteAddr
 }
 
-// SetDeadline implement net.Conn
+// SetDeadline set socket recv & send deadline
 func (c *Conn) SetDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed {
@@ -170,7 +170,7 @@ func (c *Conn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-// SetReadDeadline implement net.Conn
+// SetReadDeadline set socket recv deadline
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed && len(c.writeList) == 0 {
@@ -183,7 +183,7 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline implement net.Conn
+// SetWriteDeadline set socket send deadline
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed {
@@ -196,12 +196,66 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// SetsockoptLinger 1 & 0 help to decrease time_wait
-func (c *Conn) SetsockoptLinger(onoff int32, linger int32) error {
+// SetNoDelay set socket nodelay
+func (c *Conn) SetNoDelay(nodelay bool) error {
+	if nodelay {
+		return syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	}
+	return syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 0)
+}
+
+// SetReadBuffer set socket recv buffer length
+func (c *Conn) SetReadBuffer(bytes int) error {
+	return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bytes)
+}
+
+// SetWriteBuffer set socket send buffer length
+func (c *Conn) SetWriteBuffer(bytes int) error {
+	return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bytes)
+}
+
+// SetKeepAlive set socket keepalive
+func (c *Conn) SetKeepAlive(keepalive bool) error {
+	if keepalive {
+		return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1)
+	}
+	return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 0)
+}
+
+// SetKeepAlivePeriod set socket keepalive peroid
+func (c *Conn) SetKeepAlivePeriod(d time.Duration) error {
+	d += (time.Second - time.Nanosecond)
+	secs := int(d.Seconds())
+	if err := syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, secs); err != nil {
+		return err
+	}
+	return syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, secs)
+}
+
+// SetLinger set socket linger
+// to decrease time_wait, plz set onoff=1 && linger=0
+func (c *Conn) SetLinger(onoff int32, linger int32) error {
 	return syscall.SetsockoptLinger(c.fd, syscall.SOL_SOCKET, syscall.SO_LINGER, &syscall.Linger{
 		Onoff:  onoff,  // 1
 		Linger: linger, // 0
 	})
+}
+
+// Session return user session
+func (c *Conn) Session() interface{} {
+	return c.session
+}
+
+// SetSession set user session
+func (c *Conn) SetSession(session interface{}) bool {
+	if session == nil {
+		return false
+	}
+	c.mux.Lock()
+	ok := (c.session == session)
+	c.session = session
+	c.mux.Unlock()
+	return ok
 }
 
 func (c *Conn) writev(in [][]byte) (int, error) {
@@ -259,7 +313,6 @@ func (c *Conn) writeDirect(in [][]byte) (int, error) {
 		if nwrite > 0 {
 			totalWrite += nwrite
 			c.left -= nwrite
-			c.nwrite += nwrite
 			if nwrite < ntotal {
 
 				ntotal = nwrite
@@ -309,14 +362,16 @@ func (c *Conn) closeWithError(err error) error {
 		c.g.decrease()
 		c.g.pollers[fd%len(c.g.pollers)].deleteConn(c)
 		c.closed = true
+		c.session = nil
 		c.closeErr = err
 		c.mux.Unlock()
 
-		if err != nil {
-			c.g.workers[fd%len(c.g.workers)].pushEvent(event{c: c, t: _EVENT_CLOSE})
-		} else {
-			c.g.workers[fd%len(c.g.workers)].onCloseEvent(c)
-		}
+		// if err != nil {
+		// 	c.g.workers[fd%len(c.g.workers)].pushEvent(event{c: c, t: _EVENT_CLOSE})
+		// } else {
+		// 	c.g.workers[fd%len(c.g.workers)].onCloseEvent(c)
+		// }
+		c.g.workers[fd%len(c.g.workers)].onCloseEvent(c)
 
 		return syscallClose(fd)
 	}
@@ -325,7 +380,7 @@ func (c *Conn) closeWithError(err error) error {
 	return nil
 }
 
-func (c *Conn) dump() error {
+func (c *Conn) Flush() error {
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	if c.closed {
@@ -344,9 +399,8 @@ func (c *Conn) dump() error {
 }
 
 // NewConn is a factory impl
-func NewConn(g *Gopher, fd int, remoteAddr net.Addr) *Conn {
+func NewConn(fd int, remoteAddr net.Addr) *Conn {
 	return &Conn{
-		g:          g,
 		fd:         fd,
 		remoteAddr: remoteAddr,
 	}
