@@ -13,6 +13,7 @@ var (
 	errClosed       = errors.New("conn closed")
 	errInvalidData  = errors.New("invalid data")
 	errWriteWaiting = errors.New("write waiting")
+	errTimeout      = errors.New("timeout")
 	errReadTimeout  = errors.New("read timeout")
 	errWriteTimeout = errors.New("write timeout")
 )
@@ -24,8 +25,8 @@ type Conn struct {
 	g *Gopher // g
 
 	fd     int // file descriptor
-	rIndex int // read timer index
-	wIndex int // write timer index
+	rTimer *time.Timer
+	wTimer *time.Timer
 
 	left      int      // left to send
 	writeList [][]byte // send queue
@@ -89,12 +90,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 	}
 
 	if c.left == 0 {
-		tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		if tw != nil {
-			tw.delete(c, &c.wIndex)
+		if c.wTimer != nil {
+			c.wTimer.Stop()
 		}
 	} else {
-		c.addWrite()
+		c.setReadWrite()
 	}
 
 	c.mux.Unlock()
@@ -120,12 +120,11 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 		return n, err
 	}
 	if c.left == 0 {
-		tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		if tw != nil {
-			tw.delete(c, &c.wIndex)
+		if c.wTimer != nil {
+			c.wTimer.Stop()
 		}
 	} else {
-		c.addWrite()
+		c.setReadWrite()
 	}
 
 	c.mux.Unlock()
@@ -151,13 +150,20 @@ func (c *Conn) RemoteAddr() net.Addr {
 func (c *Conn) SetDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed {
-		tw := c.g.pollers[c.fd%len(c.g.pollers)].twRead
-		if tw != nil {
-			tw.reset(c, &c.rIndex, t)
+		now := time.Now()
+		if t.Before(now) {
+			c.closeWithErrorWithoutLock(errTimeout)
+			return errTimeout
 		}
-		tw = c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		if tw != nil {
-			tw.reset(c, &c.wIndex, t)
+		if c.rTimer == nil {
+			c.rTimer = time.AfterFunc(t.Sub(now), func() { c.closeWithError(errReadTimeout) })
+		} else {
+			c.rTimer.Reset(t.Sub(now))
+		}
+		if c.wTimer == nil {
+			c.wTimer = time.AfterFunc(t.Sub(now), func() { c.closeWithError(errWriteTimeout) })
+		} else {
+			c.wTimer.Reset(t.Sub(now))
 		}
 	}
 	c.mux.Unlock()
@@ -168,9 +174,15 @@ func (c *Conn) SetDeadline(t time.Time) error {
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed && len(c.writeList) == 0 {
-		tw := c.g.pollers[c.fd%len(c.g.pollers)].twRead
-		if tw != nil {
-			tw.reset(c, &c.rIndex, t)
+		now := time.Now()
+		if t.Before(now) {
+			c.closeWithErrorWithoutLock(errReadTimeout)
+			return errReadTimeout
+		}
+		if c.rTimer == nil {
+			c.rTimer = time.AfterFunc(t.Sub(now), func() { c.closeWithError(errReadTimeout) })
+		} else {
+			c.rTimer.Reset(t.Sub(now))
 		}
 	}
 	c.mux.Unlock()
@@ -181,9 +193,15 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed {
-		tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		if tw != nil {
-			tw.reset(c, &c.wIndex, t)
+		now := time.Now()
+		if t.Before(now) {
+			c.closeWithErrorWithoutLock(errWriteTimeout)
+			return errWriteTimeout
+		}
+		if c.wTimer == nil {
+			c.wTimer = time.AfterFunc(t.Sub(now), func() { c.closeWithError(errWriteTimeout) })
+		} else {
+			c.wTimer.Reset(t.Sub(now))
 		}
 	}
 	c.mux.Unlock()
@@ -246,17 +264,27 @@ func (c *Conn) SetSession(session interface{}) bool {
 		return false
 	}
 	c.mux.Lock()
-	ok := (c.session == session)
-	c.session = session
+	if c.session == nil {
+		c.session = session
+		c.mux.Unlock()
+		return true
+	}
 	c.mux.Unlock()
-	return ok
+	return false
 }
 
-// addWrite event
-func (c *Conn) addWrite() {
+// setRead event
+func (c *Conn) setRead() {
+	if !c.closed && c.isWAdded {
+		c.isWAdded = false
+		c.g.pollers[c.fd%len(c.g.pollers)].setRead(c.fd)
+	}
+}
+
+func (c *Conn) setReadWrite() {
 	if !c.closed && !c.isWAdded {
 		c.isWAdded = true
-		c.g.pollers[c.fd%len(c.g.pollers)].addWrite(c.fd)
+		c.g.pollers[c.fd%len(c.g.pollers)].setReadWrite(c.fd)
 	}
 }
 
@@ -313,19 +341,18 @@ func (c *Conn) flush() error {
 	c.left = 0
 	c.writeList = nil
 	_, err := c.writev(wl)
-	if err != nil && err != syscall.EAGAIN {
+	if err != nil && err != syscall.EAGAIN && err != syscall.EINTR {
 		c.closed = true
 		c.mux.Unlock()
 		c.closeWithErrorWithoutLock(err)
 		return err
 	}
 	if c.left == 0 {
-		tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		if tw != nil {
-			tw.delete(c, &c.wIndex)
+		if c.wTimer != nil {
+			c.wTimer.Stop()
 		}
 	} else {
-		c.addWrite()
+		c.setReadWrite()
 	}
 
 	c.mux.Unlock()
@@ -367,11 +394,10 @@ func (c *Conn) writeCache(in [][]byte) (int, error) {
 // writevSocket
 func (c *Conn) writevSocket(in [][]byte) (int, error) {
 	var (
-		err        error
-		ntotal     int
-		nwrite     int
-		totalWrite int
-		iovec      = make([]syscall.Iovec, len(in))
+		err    error
+		ntotal int
+		nwrite int
+		iovec  = make([]syscall.Iovec, len(in))
 	)
 
 	for i, slice := range in {
@@ -389,44 +415,35 @@ func (c *Conn) writevSocket(in [][]byte) (int, error) {
 
 	c.left += ntotal
 
-	for {
-		nwRaw, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(c.fd), uintptr(unsafe.Pointer(&iovec[0])), uintptr(len(iovec)))
-		if errno != 0 {
-			err = syscall.Errno(errno)
-		}
-		nwrite = int(nwRaw)
-		if nwrite > 0 {
-			totalWrite += nwrite
-			c.left -= nwrite
-			if nwrite < ntotal {
-				for i := 0; i < len(in); i++ {
-					if len(in[i]) < nwrite {
-						nwrite -= len(in[i])
-					} else if len(in[i]) == nwrite {
-						in = in[i+1:]
-						iovec = iovec[i+1:]
-						iovec[0] = syscall.Iovec{&(in[0][0]), uint64(len(in[0]))}
-						break
-					} else {
-						in[i] = in[i][nwrite:]
-						in = in[i:]
-						iovec = iovec[i:]
-						iovec[0] = syscall.Iovec{&(in[0][0]), uint64(len(in[0]))}
-						break
-					}
+	nwRaw, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(c.fd), uintptr(unsafe.Pointer(&iovec[0])), uintptr(len(iovec)))
+	if errno != 0 {
+		err = syscall.Errno(errno)
+	}
+	nwrite = int(nwRaw)
+	if nwrite > 0 {
+		c.left -= nwrite
+		if nwrite < ntotal {
+			for i := 0; i < len(in); i++ {
+				if len(in[i]) < nwrite {
+					nwrite -= len(in[i])
+				} else if len(in[i]) == nwrite {
+					in = in[i+1:]
+					iovec = iovec[i+1:]
+					iovec[0] = syscall.Iovec{&(in[0][0]), uint64(len(in[0]))}
+					break
+				} else {
+					in[i] = in[i][nwrite:]
+					in = in[i:]
+					iovec = iovec[i:]
+					iovec[0] = syscall.Iovec{&(in[0][0]), uint64(len(in[0]))}
+					break
 				}
-				c.writeList = append(c.writeList, in...)
 			}
+			c.writeList = append(c.writeList, in...)
 		}
-
-		if err == syscall.EINTR {
-			continue
-		}
-
-		break
 	}
 
-	return totalWrite, err
+	return int(nwRaw), err
 }
 
 // overflow control write list size of each fd
@@ -449,12 +466,10 @@ func (c *Conn) closeWithError(err error) error {
 // closeWithErrorWithoutLock
 func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	fd := c.fd
-	c.g.decrease()
-	c.g.pollers[fd%len(c.g.pollers)].deleteConn(c)
-
 	c.session = nil
 	c.closeErr = err
-	c.g.workers[fd%len(c.g.workers)].onCloseEvent(c)
+	c.g.pollers[fd%len(c.g.pollers)].deleteConn(c)
+
 	return syscallClose(fd)
 }
 
