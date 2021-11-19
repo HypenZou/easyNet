@@ -34,7 +34,8 @@ type Conn struct {
 	isWAdded bool  // write event
 	closeErr error // err on closed
 
-	remoteAddr net.Addr // remote addr
+	lAddr net.Addr // local addr
+	rAddr net.Addr // remote addr
 
 	session interface{} // user session
 }
@@ -81,8 +82,9 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 	n, err := c.write(b)
 	if err != nil && err != syscall.EAGAIN {
-		c.closeWithErrorWithoutLock(errInvalidData)
+		c.closed = true
 		c.mux.Unlock()
+		c.closeWithErrorWithoutLock(errInvalidData)
 		return n, err
 	}
 
@@ -112,8 +114,9 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 
 	n, err := c.writev(in)
 	if err != nil && err != syscall.EAGAIN {
-		c.closeWithErrorWithoutLock(err)
+		c.closed = true
 		c.mux.Unlock()
+		c.closeWithErrorWithoutLock(err)
 		return n, err
 	}
 	if c.left == 0 {
@@ -136,12 +139,12 @@ func (c *Conn) Close() error {
 
 // LocalAddr return socket local addr
 func (c *Conn) LocalAddr() net.Addr {
-	return c.g.localAddr
+	return c.lAddr
 }
 
 // RemoteAddr return socket remote addr
 func (c *Conn) RemoteAddr() net.Addr {
-	return c.remoteAddr
+	return c.rAddr
 }
 
 // SetDeadline set socket recv & send deadline
@@ -249,6 +252,7 @@ func (c *Conn) SetSession(session interface{}) bool {
 	return ok
 }
 
+// addWrite event
 func (c *Conn) addWrite() {
 	if !c.closed && !c.isWAdded {
 		c.isWAdded = true
@@ -256,6 +260,7 @@ func (c *Conn) addWrite() {
 	}
 }
 
+// write buffer
 func (c *Conn) write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -296,7 +301,7 @@ func (c *Conn) write(b []byte) (int, error) {
 	return nwrite, err
 }
 
-// Flush dump write list data to socket
+// flush dump write list data to socket
 func (c *Conn) flush() error {
 	c.mux.Lock()
 	if c.closed {
@@ -309,8 +314,9 @@ func (c *Conn) flush() error {
 	c.writeList = nil
 	_, err := c.writev(wl)
 	if err != nil && err != syscall.EAGAIN {
-		c.closeWithErrorWithoutLock(err)
+		c.closed = true
 		c.mux.Unlock()
+		c.closeWithErrorWithoutLock(err)
 		return err
 	}
 	if c.left == 0 {
@@ -326,14 +332,16 @@ func (c *Conn) flush() error {
 	return err
 }
 
+// writev
 func (c *Conn) writev(in [][]byte) (int, error) {
 	if len(c.writeList) == 0 {
-		return c.writeDirect(in)
+		return c.writevSocket(in)
 	}
-	return c.writeQueue(in)
+	return c.writeCache(in)
 }
 
-func (c *Conn) writeQueue(in [][]byte) (int, error) {
+// writeCache
+func (c *Conn) writeCache(in [][]byte) (int, error) {
 	var ntotal int
 	for _, b := range in {
 		if len(b) == 0 {
@@ -356,7 +364,8 @@ func (c *Conn) writeQueue(in [][]byte) (int, error) {
 	return 0, nil
 }
 
-func (c *Conn) writeDirect(in [][]byte) (int, error) {
+// writevSocket
+func (c *Conn) writevSocket(in [][]byte) (int, error) {
 	var (
 		err        error
 		ntotal     int
@@ -420,37 +429,40 @@ func (c *Conn) writeDirect(in [][]byte) (int, error) {
 	return totalWrite, err
 }
 
+// overflow control write list size of each fd
 func (c *Conn) overflow(n int) bool {
 	return c.g.memControl && c.left+n > int(c.g.maxWriteBuffer)
 }
 
+// closeWithError with lock
 func (c *Conn) closeWithError(err error) error {
 	c.mux.Lock()
-	err = c.closeWithErrorWithoutLock(err)
-	c.mux.Unlock()
-	return err
-}
-
-func (c *Conn) closeWithErrorWithoutLock(err error) error {
-	fd := c.fd
 	if !c.closed {
-		c.g.decrease()
-		c.g.pollers[fd%len(c.g.pollers)].deleteConn(c)
 		c.closed = true
-		c.session = nil
-		c.closeErr = err
-
-		c.g.workers[fd%len(c.g.workers)].onCloseEvent(c)
-
-		return syscallClose(fd)
+		c.mux.Unlock()
+		return c.closeWithErrorWithoutLock(err)
 	}
+	c.mux.Unlock()
 	return nil
 }
 
+// closeWithErrorWithoutLock
+func (c *Conn) closeWithErrorWithoutLock(err error) error {
+	fd := c.fd
+	c.g.decrease()
+	c.g.pollers[fd%len(c.g.pollers)].deleteConn(c)
+
+	c.session = nil
+	c.closeErr = err
+	c.g.workers[fd%len(c.g.workers)].onCloseEvent(c)
+	return syscallClose(fd)
+}
+
 // NewConn is a factory impl
-func NewConn(fd int, remoteAddr net.Addr) *Conn {
+func NewConn(fd int, lAddr, rAddr net.Addr) *Conn {
 	return &Conn{
-		fd:         fd,
-		remoteAddr: remoteAddr,
+		fd:    fd,
+		lAddr: lAddr,
+		rAddr: rAddr,
 	}
 }

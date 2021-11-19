@@ -9,11 +9,11 @@ import (
 
 func onOpen(c *easyNet.Conn) {
 	c.SetReadDeadline(time.Now().Add(time.Second * 10))
-	fmt.Println("onOpen:", c.RemoteAddr().String(), time.Now().Format("15:04:05.000"))
+	fmt.Println("onOpen:", c.LocalAddr().String(), c.RemoteAddr().String(), time.Now().Format("15:04:05.000"))
 }
 
 func onClose(c *easyNet.Conn, err error) {
-	fmt.Println("onClose:", c.RemoteAddr().String(), time.Now().Format("15:04:05.000"), err)
+	fmt.Println("onClose:", c.LocalAddr().String(), c.RemoteAddr().String(), time.Now().Format("15:04:05.000"), err)
 }
 
 func onData(c *easyNet.Conn, data []byte) {
