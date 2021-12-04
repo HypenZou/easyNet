@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/lesismal/easyNet"
+	"github.com/wubbalubbaaa/easyNet"
 )
 
 func onOpen(c *easyNet.Conn) {

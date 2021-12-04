@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lesismal/easyNet"
+	"github.com/wubbalubbaaa/easyNet"
 )
 
 var (
