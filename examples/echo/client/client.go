@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/wubbalubbaaa/nbio"
+	"github.com/wubbalubbaaa/easyNet"
 )
 
 var (
@@ -23,19 +23,19 @@ func main() {
 		totalWrite int64
 	)
 
-	g := nbio.NewGopher(nbio.Config{NPoller: 1})
+	g := easyNet.NewGopher(easyNet.Config{NPoller: 1})
 	defer g.Stop()
 
-	g.OnOpen(func(c *nbio.Conn) {
+	g.OnOpen(func(c *easyNet.Conn) {
 		// c.SetReadDeadline(time.Now().Add(time.Second * 10))
 	})
-	g.OnData(func(c *nbio.Conn, data []byte) {
+	g.OnData(func(c *easyNet.Conn, data []byte) {
 		atomic.AddInt64(&qps, 1)
 		atomic.AddInt64(&totalRead, int64(len(data)))
 		atomic.AddInt64(&totalWrite, int64(len(data)))
 		c.Write(append([]byte(nil), data...))
 	})
-	g.OnClose(func(c *nbio.Conn, err error) {
+	g.OnClose(func(c *easyNet.Conn, err error) {
 		fmt.Printf("OnClose: %v, %v\n", c.LocalAddr().String(), c.RemoteAddr().String())
 	})
 
@@ -49,7 +49,7 @@ func main() {
 		idx := i
 		data := make([]byte, bufsize)
 		go func() {
-			c, err := nbio.Dial("tcp", addrs[idx%2])
+			c, err := easyNet.Dial("tcp", addrs[idx%2])
 			if err != nil {
 				fmt.Printf("Dial failed: %v\n", err)
 			}
