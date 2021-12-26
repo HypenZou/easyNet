@@ -3,11 +3,13 @@
 package easyNet
 
 import (
-	"log"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/wubbalubbaaa/easyNet/log"
 )
 
 type poller struct {
@@ -62,13 +64,10 @@ func (p *poller) accept() error {
 func (p *poller) readConn(c *Conn) {
 	for {
 		buffer := p.g.borrow(c)
-		n, err := c.Read(buffer)
+		b, err := p.g.onRead(c, buffer)
 		if err == nil {
-			p.g.onData(c, buffer[:n])
+			p.g.onData(c, b)
 		} else {
-			if c.closeErr == nil {
-				c.closeErr = err
-			}
 			c.Close()
 		}
 		p.g.payback(c, buffer)
@@ -90,7 +89,7 @@ func (p *poller) acceptable() bool {
 func (p *poller) addConn(c *Conn) error {
 	c.g = p.g
 	p.g.mux.Lock()
-	p.g.conns[c] = make([]byte, p.g.readBufferSize)
+	p.g.connsStd[c] = struct{}{}
 	p.g.mux.Unlock()
 	p.increase()
 	p.g.onOpen(c)
@@ -101,27 +100,22 @@ func (p *poller) addConn(c *Conn) error {
 
 func (p *poller) deleteConn(c *Conn) {
 	p.g.mux.Lock()
-	delete(p.g.conns, c)
+	delete(p.g.connsStd, c)
 	p.g.mux.Unlock()
 	p.decrease()
 	p.g.decrease()
 	p.g.onClose(c, c.closeErr)
 }
 
-func (p *poller) stop() {
-	log.Printf("poller[%v] stop...", p.index)
-	p.shutdown = true
-	if p.isListener {
-		p.listener.Close()
-	}
-	close(p.chStop)
-}
-
 func (p *poller) start() {
+	if p.g.lockThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 	defer p.g.Done()
 
-	log.Printf("%v[%v] start", p.pollType, p.index)
-	defer log.Printf("%v[%v] stopped", p.pollType, p.index)
+	log.Debug("Poller[%v_%v_%v] start", p.g.Name, p.pollType, p.index)
+	defer log.Debug("Poller[%v_%v_%v] stopped", p.g.Name, p.pollType, p.index)
 
 	if p.isListener {
 		var err error
@@ -130,18 +124,26 @@ func (p *poller) start() {
 			err = p.accept()
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Temporary() {
-					log.Printf("Accept error: %v; retrying...", err)
+					log.Error("Poller[%v_%v_%v] Accept failed: temporary error, retrying...", p.g.Name, p.pollType, p.index)
 					time.Sleep(time.Second / 20)
 				} else {
-					log.Printf("Accept error: %v", err)
+					log.Error("Poller[%v_%v_%v] Accept failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
 					break
 				}
 			}
 
 		}
-	} else {
-		<-p.chStop
 	}
+	<-p.chStop
+}
+
+func (p *poller) stop() {
+	log.Debug("Poller[%v_%v_%v] stop...", p.g.Name, p.pollType, p.index)
+	p.shutdown = true
+	if p.isListener {
+		p.listener.Close()
+	}
+	close(p.chStop)
 }
 
 func newPoller(g *Gopher, isListener bool, index int) (*poller, error) {
@@ -159,9 +161,9 @@ func newPoller(g *Gopher, isListener bool, index int) (*poller, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.pollType = "listener"
+		p.pollType = "LISTENER"
 	} else {
-		p.pollType = "poller"
+		p.pollType = "POLLER"
 	}
 
 	return p, nil

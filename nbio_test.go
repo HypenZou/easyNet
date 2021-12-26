@@ -115,7 +115,7 @@ func Test10k(t *testing.T) {
 	var clientNum int64 = 1024 * 10
 	var done = make(chan int)
 
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS != "linux" {
 		clientNum = 100
 	}
 
@@ -142,14 +142,11 @@ func Test10k(t *testing.T) {
 				one()
 			} else {
 				go one()
-				// 	time.Sleep(time.Second / 1000)
 			}
 		}
 	}()
 
-	log.Println("== Test10k before done 111")
 	<-done
-	log.Println("== Test10k before done 222")
 }
 
 func TestTimeout(t *testing.T) {
@@ -162,14 +159,14 @@ func TestTimeout(t *testing.T) {
 
 	var done = make(chan int)
 	var begin time.Time
-	var timeout = time.Second / 20
+	var timeout = time.Second / 10
 	g.OnOpen(func(c *Conn) {
 		begin = time.Now()
 		c.SetReadDeadline(begin.Add(timeout))
 	})
 	g.OnClose(func(c *Conn, err error) {
 		to := time.Since(begin)
-		if to > timeout+time.Second/10 {
+		if to > timeout+time.Second/5 {
 			log.Fatalf("timeout: %v, want: %v", to, timeout)
 		}
 		close(done)
@@ -192,16 +189,23 @@ func TestHeapTimer(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	timeout := time.Second / 20
+	timeout := time.Second / 10
 
+	testHeapTimerNormal(g, t, timeout)
+	testHeapTimerExecPanic(g, t, timeout)
+	testHeapTimerNormalExecMany(g, t, timeout)
+	testHeapTimerExecManyRandtime(g, t, timeout)
+}
+
+func testHeapTimerNormal(g *Gopher, t *testing.T, timeout time.Duration) {
 	t1 := time.Now()
 	ch1 := make(chan int)
-	g.afterFunc(timeout, func() {
+	g.AfterFunc(timeout*5, func() {
 		close(ch1)
 	})
 	<-ch1
 	to1 := time.Since(t1)
-	if to1 < timeout-timeout/5 || to1 > timeout+timeout/5 {
+	if to1 < timeout*4 || to1 > timeout*10 {
 		log.Fatalf("invalid to1: %v", to1)
 	}
 
@@ -213,7 +217,7 @@ func TestHeapTimer(t *testing.T) {
 	it2.Reset(timeout * 5)
 	<-ch2
 	to2 := time.Since(t2)
-	if to2 < timeout*4 || to2 > timeout*6 {
+	if to2 < timeout*4 || to2 > timeout*10 {
 		log.Fatalf("invalid to2: %v", to2)
 	}
 
@@ -222,13 +226,21 @@ func TestHeapTimer(t *testing.T) {
 		close(ch3)
 	})
 	it3.Stop()
-	<-time.After(timeout + timeout/4)
+	<-g.After(timeout * 2)
 	select {
 	case <-ch3:
 		log.Fatalf("stop failed")
 	default:
 	}
+}
 
+func testHeapTimerExecPanic(g *Gopher, t *testing.T, timeout time.Duration) {
+	g.afterFunc(timeout, func() {
+		panic("test")
+	})
+}
+
+func testHeapTimerNormalExecMany(g *Gopher, t *testing.T, timeout time.Duration) {
 	ch4 := make(chan int, 5)
 	for i := 0; i < 5; i++ {
 		n := i + 1
@@ -243,17 +255,15 @@ func TestHeapTimer(t *testing.T) {
 		})
 	}
 
-	g.afterFunc(timeout, func() {
-		panic("test")
-	})
-
 	for i := 0; i < 5; i++ {
 		n := <-ch4
 		if n != i+1 {
 			log.Fatalf("invalid n: %v, %v", i, n)
 		}
 	}
+}
 
+func testHeapTimerExecManyRandtime(g *Gopher, t *testing.T, timeout time.Duration) {
 	its := make([]*htimer, 100)[0:0]
 	ch5 := make(chan int, 100)
 	for i := 0; i < 100; i++ {
@@ -356,7 +366,6 @@ func TestFuzz(t *testing.T) {
 		Addrs:   []string{"localhost:8889", "localhost:8889"},
 	})
 	gErr.Start()
-
 }
 
 func TestStop(t *testing.T) {

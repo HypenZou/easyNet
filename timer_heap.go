@@ -9,9 +9,10 @@ const (
 	timeForever = time.Duration(math.MaxInt64)
 )
 
-// var (
-// 	DefaultTimer = New("default")
-// )
+// Timer type for export
+type Timer struct {
+	*htimer
+}
 
 // heap timer item
 type htimer struct {

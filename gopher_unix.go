@@ -3,13 +3,12 @@
 package easyNet
 
 import (
-	"container/heap"
-	"log"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/wubbalubbaaa/easyNet/log"
 )
 
 // Start init and start pollers
@@ -64,51 +63,12 @@ func (g *Gopher) Start() error {
 	}
 
 	g.Add(1)
-	go func() {
-		defer g.Done()
-		log.Printf("gopher timer start")
-		defer log.Printf("gopher timer stopped")
-		for {
-			select {
-			case <-g.trigger.C:
-				for {
-					g.tmux.Lock()
-					if g.timers.Len() == 0 {
-						g.tmux.Unlock()
-						break
-					}
-					now := time.Now()
-					it := g.timers[0]
-					if now.After(it.expire) {
-						heap.Pop(&g.timers)
-						g.tmux.Unlock()
-						func() {
-							defer func() {
-								err := recover()
-								if err != nil {
-									log.Printf("timer exec failed: %v", err)
-									debug.PrintStack()
-								}
-							}()
-							it.f()
-						}()
-
-					} else {
-						g.trigger.Reset(it.expire.Sub(now))
-						g.tmux.Unlock()
-						break
-					}
-				}
-			case <-g.chTimer:
-				return
-			}
-		}
-	}()
+	go g.timerLoop()
 
 	if len(g.addrs) == 0 {
-		log.Printf("gopher start")
+		log.Info("Gopher[%v] start", g.Name)
 	} else {
-		log.Printf("gopher start listen on: [\"%v\"]", strings.Join(g.addrs, `", "`))
+		log.Info("Gopher[%v] start listen on: [\"%v\"]", g.Name, strings.Join(g.addrs, `", "`))
 	}
 	return nil
 }
@@ -116,6 +76,9 @@ func (g *Gopher) Start() error {
 // NewGopher is a factory impl
 func NewGopher(conf Config) *Gopher {
 	cpuNum := uint32(runtime.NumCPU())
+	if conf.Name == "" {
+		conf.Name = "NB"
+	}
 	if conf.MaxLoad == 0 {
 		conf.MaxLoad = DefaultMaxLoad
 	}
@@ -130,6 +93,7 @@ func NewGopher(conf Config) *Gopher {
 	}
 
 	g := &Gopher{
+		Name:               conf.Name,
 		network:            conf.Network,
 		addrs:              conf.Addrs,
 		maxLoad:            int64(conf.MaxLoad),
@@ -139,15 +103,28 @@ func NewGopher(conf Config) *Gopher {
 		maxWriteBufferSize: conf.MaxWriteBufferSize,
 		listeners:          make([]*poller, conf.NListener),
 		pollers:            make([]*poller, conf.NPoller),
-		conns:              map[*Conn][]byte{},
-		connsLinux:         make([]*Conn, conf.MaxLoad+64),
+		connsUnix:          make([]*Conn, conf.MaxLoad+64),
 		onOpen:             func(c *Conn) {},
 		onClose:            func(c *Conn, err error) {},
-		onData:             func(c *Conn, data []byte) {},
+		onRead: func(c *Conn, b []byte) ([]byte, error) {
+			n, err := c.Read(b)
+			if err != nil {
+				return nil, err
+			}
+			return b[:n], err
+		},
+		onData: func(c *Conn, data []byte) {},
 
 		trigger: time.NewTimer(timeForever),
 		chTimer: make(chan struct{}),
 	}
+
+	g.OnMemAlloc(func(c *Conn) []byte {
+		if c.readBuffer == nil {
+			c.readBuffer = make([]byte, g.readBufferSize)
+		}
+		return c.readBuffer
+	})
 
 	return g
 }
