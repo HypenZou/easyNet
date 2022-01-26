@@ -3,6 +3,8 @@
 package easyNet
 
 import (
+	"errors"
+	"net"
 	"runtime"
 	"strings"
 	"syscall"
@@ -53,7 +55,7 @@ func (g *Gopher) Start() error {
 	}
 
 	for i := uint32(0); i < g.pollerNum; i++ {
-		g.pollers[i].readBuffer = make([]byte, g.readBufferSize)
+		g.pollers[i].ReadBuffer = make([]byte, g.readBufferSize)
 		g.Add(1)
 		go g.pollers[i].start()
 	}
@@ -71,6 +73,22 @@ func (g *Gopher) Start() error {
 		log.Info("Gopher[%v] start listen on: [\"%v\"]", g.Name, strings.Join(g.addrs, `", "`))
 	}
 	return nil
+}
+
+// Conn converts net.Conn to *Conn
+func (g *Gopher) Conn(conn net.Conn) (*Conn, error) {
+	if conn == nil {
+		return nil, errors.New("invalid conn: nil")
+	}
+	c, ok := conn.(*Conn)
+	if !ok {
+		var err error
+		c, err = dupStdConn(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // NewGopher is a factory impl
@@ -104,27 +122,12 @@ func NewGopher(conf Config) *Gopher {
 		listeners:          make([]*poller, conf.NListener),
 		pollers:            make([]*poller, conf.NPoller),
 		connsUnix:          make([]*Conn, conf.MaxLoad+64),
-		onOpen:             func(c *Conn) {},
-		onClose:            func(c *Conn, err error) {},
-		onRead: func(c *Conn, b []byte) ([]byte, error) {
-			n, err := c.Read(b)
-			if err != nil {
-				return nil, err
-			}
-			return b[:n], err
-		},
-		onData: func(c *Conn, data []byte) {},
 
 		trigger: time.NewTimer(timeForever),
 		chTimer: make(chan struct{}),
 	}
 
-	g.OnMemAlloc(func(c *Conn) []byte {
-		if c.readBuffer == nil {
-			c.readBuffer = make([]byte, g.readBufferSize)
-		}
-		return c.readBuffer
-	})
+	g.initHandlers()
 
 	return g
 }

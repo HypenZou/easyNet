@@ -34,7 +34,7 @@ type Conn struct {
 	lAddr net.Addr
 	rAddr net.Addr
 
-	readBuffer []byte
+	ReadBuffer []byte
 
 	session interface{}
 }
@@ -55,6 +55,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 	c.mux.Unlock()
 
 	n, err := syscall.Read(int(c.fd), b)
+	if err == nil {
+		c.g.afterRead(c)
+	}
+
 	return n, err
 }
 
@@ -66,6 +70,8 @@ func (c *Conn) Write(b []byte) (int, error) {
 		c.mux.Unlock()
 		return -1, errClosed
 	}
+
+	c.g.beforeWrite(c)
 
 	n, err := c.write(b)
 	if err != nil && err != syscall.EAGAIN {
@@ -101,6 +107,8 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 		c.mux.Unlock()
 		return 0, errClosed
 	}
+
+	c.g.beforeWrite(c)
 
 	n, err := c.writev(in)
 	if err != nil && err != syscall.EAGAIN {
@@ -481,6 +489,44 @@ func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	}
 
 	return syscall.Close(fd)
+}
+
+func dupStdConn(conn net.Conn) (*Conn, error) {
+	sc, ok := conn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return nil, errors.New("RawConn Unsupported")
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return nil, errors.New("RawConn Unsupported")
+	}
+
+	var newFd int
+	errCtrl := rc.Control(func(fd uintptr) {
+		newFd, err = syscall.Dup(int(fd))
+	})
+
+	if errCtrl != nil {
+		return nil, errCtrl
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	err = syscall.SetNonblock(newFd, true)
+	if err != nil {
+		syscall.Close(newFd)
+		return nil, err
+	}
+
+	return &Conn{
+		fd:    newFd,
+		lAddr: conn.LocalAddr(),
+		rAddr: conn.RemoteAddr(),
+	}, nil
 }
 
 func newConn(fd int, lAddr, rAddr net.Addr) *Conn {

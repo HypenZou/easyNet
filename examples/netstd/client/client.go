@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net"
 	"time"
 
 	"github.com/wubbalubbaaa/easyNet"
@@ -41,7 +42,7 @@ func main() {
 	}
 	defer g.Stop()
 
-	c, err := easyNet.Dial("tcp", addr)
+	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		fmt.Printf("Dial failed: %v\n", err)
 	}

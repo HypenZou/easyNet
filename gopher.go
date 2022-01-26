@@ -3,6 +3,7 @@ package easyNet
 import (
 	"container/heap"
 	"fmt"
+	"net"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -24,31 +25,36 @@ const (
 
 // Config Of Gopher
 type Config struct {
-	// Name .
+	// Name describes your gopher name for logging, it's set to "NB" by default.
 	Name string
 
-	// Network .
+	// Network is the listening protocol, used with Addrs toghter.
+	// tcp* supported only by now, there's no plan for other protocol such as udp,
+	// because it's too easy to write udp server/client.
 	Network string
 
-	// Addrs .
+	// Addrs is the listening addr list for a easyNet server.
+	// if it is empty, no listener created, then the Gopher is used for client by default.
 	Addrs []string
 
-	// MaxLoad .
+	// MaxLoad decides the max online num, it's set to 10k by default.
 	MaxLoad uint32
 
-	// NListener .
+	// NListener decides the listener goroutine num on *nix, it's set to 1 by default.
 	NListener uint32
 
-	// NPoller .
+	// NPoller decides poller goroutine num, it's set to runtime.NumCPU() by default.
 	NPoller uint32
 
-	// ReadBufferSize .
+	// ReadBufferSize decides buffer size for reading, it's set to 16k by default.
 	ReadBufferSize uint32
 
-	// MaxWriteBufferSize .
+	// MaxWriteBufferSize decides max write buffer size for Conn, it's set to 1m by default.
+	// if the connection's Send-Q is full and the data cached by easyNet is
+	// more than MaxWriteBufferSize, the connection would be closed by easyNet.
 	MaxWriteBufferSize uint32
 
-	// LockThread .
+	// LockThread decides poller's goroutine to lock thread or not, it's set to false by default.
 	LockThread bool
 }
 
@@ -98,12 +104,15 @@ type Gopher struct {
 	listeners []*poller
 	pollers   []*poller
 
-	onOpen     func(c *Conn)
-	onClose    func(c *Conn, err error)
-	onRead     func(c *Conn, b []byte) ([]byte, error)
-	onData     func(c *Conn, data []byte)
-	onMemAlloc func(c *Conn) []byte
-	onMemFree  func(c *Conn, buffer []byte)
+	onOpen      func(c *Conn)
+	onClose     func(c *Conn, err error)
+	onRead      func(c *Conn, b []byte) ([]byte, error)
+	onData      func(c *Conn, data []byte)
+	onMemAlloc  func(c *Conn) []byte
+	onMemFree   func(c *Conn, buffer []byte)
+	beforeRead  func(c *Conn)
+	afterRead   func(c *Conn)
+	beforeWrite func(c *Conn)
 
 	timers  timerHeap
 	trigger *time.Timer
@@ -143,12 +152,14 @@ func (g *Gopher) Stop() {
 }
 
 // AddConn adds conn to a poller
-func (g *Gopher) AddConn(c *Conn) {
-	if c == nil {
-		return
+func (g *Gopher) AddConn(conn net.Conn) (*Conn, error) {
+	c, err := g.Conn(conn)
+	if err != nil {
+		return nil, err
 	}
 	g.increase()
 	g.pollers[uint32(c.Hash())%g.pollerNum].addConn(c)
+	return c, nil
 }
 
 // Online returns Gopher's total online
@@ -203,6 +214,33 @@ func (g *Gopher) OnMemFree(h func(c *Conn, b []byte)) {
 		panic("invalid nil handler")
 	}
 	g.onMemFree = h
+}
+
+// BeforeRead registers callback before syscall.Read
+// the handler would be called on windows
+func (g *Gopher) BeforeRead(h func(c *Conn)) {
+	if h == nil {
+		panic("invalid nil handler")
+	}
+	g.beforeRead = h
+}
+
+// AfterRead registers callback after syscall.Read
+// the handler would be called on *nix
+func (g *Gopher) AfterRead(h func(c *Conn)) {
+	if h == nil {
+		panic("invalid nil handler")
+	}
+	g.afterRead = h
+}
+
+// BeforeWrite registers callback befor syscall.Write and syscall.Writev
+// the handler would be called on windows
+func (g *Gopher) BeforeWrite(h func(c *Conn)) {
+	if h == nil {
+		panic("invalid nil handler")
+	}
+	g.beforeWrite = h
 }
 
 // State returns Gopher's state info
@@ -336,23 +374,33 @@ func (g *Gopher) timerLoop() {
 
 // PollerBuffer returns Poller's buffer by Conn, can be used on linux/bsd
 func (g *Gopher) PollerBuffer(c *Conn) []byte {
-	return g.pollers[uint32(c.Hash())%g.pollerNum].readBuffer
+	return g.pollers[uint32(c.Hash())%g.pollerNum].ReadBuffer
+}
+
+func (g *Gopher) initHandlers() {
+	g.OnOpen(func(c *Conn) {})
+	g.OnClose(func(c *Conn, err error) {})
+	g.OnRead(func(c *Conn, b []byte) ([]byte, error) {
+		n, err := c.Read(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], err
+	})
+	g.OnData(func(c *Conn, data []byte) {})
+	g.OnMemAlloc(g.PollerBuffer)
+	g.OnMemFree(func(c *Conn, buffer []byte) {})
+	g.BeforeRead(func(c *Conn) {})
+	g.AfterRead(func(c *Conn) {})
+	g.BeforeWrite(func(c *Conn) {})
 }
 
 func (g *Gopher) borrow(c *Conn) []byte {
-	if g.onMemAlloc != nil {
-		return g.onMemAlloc(c)
-	}
-	if c.readBuffer == nil {
-		c.readBuffer = make([]byte, g.readBufferSize)
-	}
-	return c.readBuffer
+	return g.onMemAlloc(c)
 }
 
 func (g *Gopher) payback(c *Conn, buffer []byte) {
-	if g.onMemFree != nil {
-		g.onMemFree(c, buffer)
-	}
+	g.onMemFree(c, buffer)
 }
 
 func (g *Gopher) increase() {
