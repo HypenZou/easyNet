@@ -1,15 +1,28 @@
+// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
+//go:build darwin || netbsd || freebsd || openbsd || dragonfly
 // +build darwin netbsd freebsd openbsd dragonfly
 
 package easyNet
 
 import (
+	"net"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/wubbalubbaaa/easyNet/log"
+	"github.com/wubbalubbaaa/easyNet/logging"
+)
+
+const (
+	// EPOLLLT .
+	EPOLLLT = 0
+
+	// EPOLLET .
+	EPOLLET = 1
 )
 
 type poller struct {
@@ -20,9 +33,9 @@ type poller struct {
 	kfd   int
 	evtfd int
 
-	index int
+	listener net.Listener
 
-	currLoad int64
+	index int
 
 	shutdown bool
 
@@ -35,74 +48,12 @@ type poller struct {
 	eventList []syscall.Kevent_t
 }
 
-func (p *poller) online() int64 {
-	return atomic.LoadInt64(&p.currLoad)
-}
-
-func (p *poller) increase() {
-	atomic.AddInt64(&p.currLoad, 1)
-}
-
-func (p *poller) decrease() {
-	atomic.AddInt64(&p.currLoad, -1)
-}
-
-func (p *poller) accept(lfd int) error {
-	fd, saddr, err := syscall.Accept(lfd)
-	if err != nil {
-		return err
-	}
-
-	if !p.acceptable(fd) {
-		syscall.Close(fd)
-		return nil
-	}
-
-	err = syscall.SetNonblock(fd, true)
-	if err != nil {
-		syscall.Close(fd)
-		return nil
-	}
-
-	laddr, err := syscall.Getsockname(fd)
-	if err != nil {
-		syscall.Close(fd)
-		return nil
-	}
-
-	c := newConn(int(fd), sockaddrToAddr(laddr), sockaddrToAddr(saddr))
-	o := p.g.pollers[int(fd)%len(p.g.pollers)]
-	o.addConn(c)
-
-	return nil
-}
-
-func (p *poller) acceptable(fd int) bool {
-	if fd < 0 {
-		return false
-	}
-	if fd >= len(p.g.connsUnix) {
-		p.g.mux.Lock()
-		p.g.connsUnix = append(p.g.connsUnix, make([]*Conn, fd-len(p.g.connsUnix)+1024)...)
-		p.g.mux.Unlock()
-	}
-	if atomic.AddInt64(&p.g.currLoad, 1) > p.g.maxLoad {
-		atomic.AddInt64(&p.g.currLoad, -1)
-		return false
-	}
-
-	return true
-}
-
 func (p *poller) addConn(c *Conn) {
 	c.g = p.g
-
 	p.g.onOpen(c)
-
 	fd := c.fd
-	p.addRead(fd)
 	p.g.connsUnix[fd] = c
-	p.increase()
+	p.addRead(c.fd)
 }
 
 func (p *poller) getConn(fd int) *Conn {
@@ -110,9 +61,14 @@ func (p *poller) getConn(fd int) *Conn {
 }
 
 func (p *poller) deleteConn(c *Conn) {
-	p.g.connsUnix[c.fd] = nil
-	p.decrease()
-	p.g.decrease()
+	if c == nil {
+		return
+	}
+	fd := c.fd
+	if c == p.g.connsUnix[fd] {
+		p.g.connsUnix[fd] = nil
+		p.deleteEvent(fd)
+	}
 	p.g.onClose(c, c.closeErr)
 }
 
@@ -134,88 +90,109 @@ func (p *poller) modWrite(fd int) {
 	p.trigger()
 }
 
-func (p *poller) deleteWrite(fd int) {
+func (p *poller) deleteEvent(fd int) {
 	p.mux.Lock()
-	p.eventList = append(p.eventList, syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_WRITE})
+	p.eventList = append(p.eventList, syscall.Kevent_t{Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_READ})
 	p.mux.Unlock()
 	p.trigger()
 }
 
 func (p *poller) readWrite(ev *syscall.Kevent_t) {
+	if ev.Flags&syscall.EV_DELETE > 0 {
+		return
+	}
 	fd := int(ev.Ident)
 	c := p.getConn(fd)
 	if c != nil {
-		if ev.Filter&syscall.EVFILT_READ != 0 {
-			buffer := p.g.borrow(c)
-			b, err := p.g.onRead(c, buffer)
-			if err == nil {
-				p.g.onData(c, b)
-			} else {
-				if err != nil && err != syscall.EINTR && err != syscall.EAGAIN {
-					c.closeWithError(err)
-					return
+		if ev.Filter&syscall.EVFILT_READ == syscall.EVFILT_READ {
+			if p.g.onRead == nil {
+				for {
+					buffer := p.g.borrow(c)
+					n, err := c.Read(buffer)
+					if n > 0 {
+						p.g.onData(c, buffer[:n])
+					}
+					p.g.payback(c, buffer)
+					if err == syscall.EINTR {
+						continue
+					}
+					if err == syscall.EAGAIN {
+						return
+					}
+					if (err != nil || n == 0) && ev.Flags&syscall.EV_DELETE == 0 {
+						c.closeWithError(err)
+					}
+					if n < len(buffer) {
+						break
+					}
 				}
+			} else {
+				p.g.onRead(c)
 			}
-			p.g.payback(c, buffer)
 		}
 
-		if ev.Filter&syscall.EVFILT_WRITE != 0 {
+		if ev.Filter&syscall.EVFILT_WRITE == syscall.EVFILT_WRITE {
 			c.flush()
 		}
+	} else {
+		syscall.Close(fd)
+		p.deleteEvent(fd)
 	}
 }
 
 func (p *poller) start() {
-	if p.g.lockThread {
+	if p.g.lockPoller {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
 	defer p.g.Done()
 
-	log.Debug("Poller[%v_%v_%v] start", p.g.Name, p.pollType, p.index)
-	defer log.Debug("Poller[%v_%v_%v] stopped", p.g.Name, p.pollType, p.index)
-	defer syscall.Close(p.kfd)
+	logging.Debug("Poller[%v_%v_%v] start", p.g.Name, p.pollType, p.index)
+	defer logging.Debug("Poller[%v_%v_%v] stopped", p.g.Name, p.pollType, p.index)
 
 	if p.isListener {
 		p.acceptorLoop()
 	} else {
+		defer syscall.Close(p.kfd)
 		p.readWriteLoop()
 	}
 }
 
 func (p *poller) acceptorLoop() {
-	var events = make([]syscall.Kevent_t, 1024)
-	var changes []syscall.Kevent_t
+	if p.g.lockListener {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 
 	p.shutdown = false
 	for !p.shutdown {
-		n, err := syscall.Kevent(p.kfd, changes, events, nil)
-		if err != nil && err != syscall.EINTR {
-			return
-		}
-
-		fd := 0
-		for i := 0; i < n; i++ {
-			fd = int(events[i].Ident)
-			switch fd {
-			case p.evtfd:
-			default:
-				err = p.accept(fd)
-				if err != nil {
-					if err == syscall.EAGAIN {
-						log.Error("Poller[%v_%v_%v] Accept failed: EAGAIN, retrying...", p.g.Name, p.pollType, p.index)
-						time.Sleep(time.Second / 20)
-					} else {
-						log.Error("Poller[%v_%v_%v] Accept failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
-						break
-					}
-				}
+		conn, err := p.listener.Accept()
+		if err == nil {
+			c, err := NBConn(conn)
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			o := p.g.pollers[int(c.fd)%len(p.g.pollers)]
+			o.addConn(c)
+		} else {
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				logging.Error("Poller[%v_%v_%v] Accept failed: temporary error, retrying...", p.g.Name, p.pollType, p.index)
+				time.Sleep(time.Second / 20)
+			} else {
+				logging.Error("Poller[%v_%v_%v] Accept failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
+				break
 			}
 		}
 	}
 }
 
 func (p *poller) readWriteLoop() {
+	if p.g.lockPoller {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
 	var events = make([]syscall.Kevent_t, 1024)
 	var changes []syscall.Kevent_t
 
@@ -241,12 +218,36 @@ func (p *poller) readWriteLoop() {
 }
 
 func (p *poller) stop() {
-	log.Debug("Poller[%v_%v_%v] stop...", p.g.Name, p.pollType, p.index)
+	logging.Debug("Poller[%v_%v_%v] stop...", p.g.Name, p.pollType, p.index)
 	p.shutdown = true
+	if p.listener != nil {
+		p.listener.Close()
+	}
 	p.trigger()
 }
 
 func newPoller(g *Gopher, isListener bool, index int) (*poller, error) {
+	if isListener {
+		if len(g.addrs) == 0 {
+			panic("invalid listener num")
+		}
+
+		addr := g.addrs[index%len(g.listeners)]
+		ln, err := net.Listen(g.network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		p := &poller{
+			g:          g,
+			index:      index,
+			listener:   ln,
+			isListener: isListener,
+			pollType:   "LISTENER",
+		}
+		return p, nil
+	}
+
 	fd, err := syscall.Kqueue()
 	if err != nil {
 		return nil, err
@@ -263,32 +264,12 @@ func newPoller(g *Gopher, isListener bool, index int) (*poller, error) {
 		return nil, err
 	}
 
-	if isListener {
-		if len(g.lfds) > 0 {
-			for _, lfd := range g.lfds {
-				_, err := syscall.Kevent(fd, []syscall.Kevent_t{
-					{Ident: uint64(lfd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_READ},
-				}, nil, nil)
-				if err != nil {
-					return nil, err
-				}
-			}
-		} else {
-			panic("invalid listener num")
-		}
-	}
-
 	p := &poller{
 		g:          g,
 		kfd:        fd,
 		index:      index,
 		isListener: isListener,
-	}
-
-	if isListener {
-		p.pollType = "LISTENER"
-	} else {
-		p.pollType = "POLLER"
+		pollType:   "POLLER",
 	}
 
 	return p, nil

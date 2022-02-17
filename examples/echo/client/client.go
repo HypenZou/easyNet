@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/wubbalubbaaa/easyNet"
-	"github.com/wubbalubbaaa/easyNet/log"
 )
 
 func main() {
@@ -18,8 +17,6 @@ func main() {
 		addr   = "localhost:8888"
 		ctx, _ = context.WithTimeout(context.Background(), time.Second)
 	)
-
-	log.SetLevel(log.LevelInfo)
 
 	rand.Read(buf)
 
@@ -50,8 +47,8 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		log.Error("timeout")
+		//log.Error("timeout")
 	case <-done:
-		log.Info("success")
+		//log.Info("success")
 	}
 }

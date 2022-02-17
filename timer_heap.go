@@ -1,3 +1,7 @@
+// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
 package easyNet
 
 import (
@@ -9,12 +13,12 @@ const (
 	timeForever = time.Duration(math.MaxInt64)
 )
 
-// Timer type for export
+// Timer type for export.
 type Timer struct {
 	*htimer
 }
 
-// heap timer item
+// heap timer item.
 type htimer struct {
 	index  int
 	expire time.Time
@@ -22,12 +26,12 @@ type htimer struct {
 	parent *Gopher
 }
 
-// cancel timer
+// cancel timer.
 func (it *htimer) Stop() {
 	it.parent.removeTimer(it)
 }
 
-// reset timer
+// reset timer.
 func (it *htimer) Reset(timeout time.Duration) {
 	it.expire = time.Now().Add(timeout)
 	it.parent.resetTimer(it)

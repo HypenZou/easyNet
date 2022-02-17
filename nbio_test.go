@@ -1,8 +1,10 @@
 package easyNet
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -10,33 +12,51 @@ import (
 	"time"
 )
 
-var addr = ":8888"
+var addr = "127.0.0.1:8888"
+var testfile = "test_tmp.file"
 var gopher *Gopher
 
-func init() {
-	addrs := []string{addr}
-	g := NewGopher(Config{
-		Network: "tcp",
-		Addrs:   addrs,
-		MaxLoad: 10,
-	})
-	g.maxLoad = 1024 * 100
+// func init() {
+// 	if err := ioutil.WriteFile(testfile, make([]byte, 1024*100), 0600); err != nil {
+// 		log.Panicf("write file failed: %v", err)
+// 	}
 
-	g.OnOpen(func(c *Conn) {
-		c.SetReadDeadline(time.Now().Add(time.Second * 10))
-	})
-	g.OnData(func(c *Conn, data []byte) {
-		c.Write(append([]byte{}, data...))
-	})
-	g.OnClose(func(c *Conn, err error) {})
+// 	addrs := []string{addr}
+// 	g := NewGopher(Config{
+// 		Network: "tcp",
+// 		Addrs:   addrs,
+// 	})
 
-	err := g.Start()
-	if err != nil {
-		log.Fatalf("Start failed: %v\n", err)
-	}
+// 	g.OnOpen(func(c *Conn) {
+// 		c.SetReadDeadline(time.Now().Add(time.Second * 10))
+// 	})
+// 	g.OnData(func(c *Conn, data []byte) {
+// 		if len(data) == 8 && string(data) == "sendfile" {
+// 			fd, err := os.Open(testfile)
+// 			if err != nil {
+// 				log.Panicf("open file failed: %v", err)
+// 			}
 
-	gopher = g
-}
+// 			if _, err = c.Sendfile(fd, 0); err != nil {
+// 				panic(err)
+// 			}
+
+// 			if err := fd.Close(); err != nil {
+// 				log.Panicf("close file failed: %v", err)
+// 			}
+// 		} else {
+// 			c.Write(append([]byte{}, data...))
+// 		}
+// 	})
+// 	g.OnClose(func(c *Conn, err error) {})
+
+// 	err := g.Start()
+// 	if err != nil {
+// 		log.Panicf("Start failed: %v\n", err)
+// 	}
+
+// 	gopher = g
+// }
 
 func TestEcho(t *testing.T) {
 	var done = make(chan int)
@@ -47,14 +67,14 @@ func TestEcho(t *testing.T) {
 	g := NewGopher(Config{})
 	err := g.Start()
 	if err != nil {
-		log.Fatalf("Start failed: %v\n", err)
+		log.Panicf("Start failed: %v\n", err)
 	}
 	defer g.Stop()
 
 	g.OnOpen(func(c *Conn) {
 		c.SetSession(1)
 		if c.Session() != 1 {
-			log.Fatalf("invalid session: %v", c.Session())
+			log.Panicf("invalid session: %v", c.Session())
 		}
 		c.SetLinger(1, 0)
 		c.SetNoDelay(true)
@@ -67,28 +87,28 @@ func TestEcho(t *testing.T) {
 	})
 	g.OnData(func(c *Conn, data []byte) {
 		recved := atomic.AddInt64(&total, int64(len(data)))
-		if recved >= int64(clientNum*msgSize) {
+		if len(data) > 0 && recved >= int64(clientNum*msgSize) {
 			close(done)
 		}
 	})
 
-	g.OnMemAlloc(func(c *Conn) []byte {
+	g.OnReadBufferAlloc(func(c *Conn) []byte {
 		return make([]byte, 1024)
 	})
-	g.OnMemFree(func(c *Conn, b []byte) {
+	g.OnReadBufferFree(func(c *Conn, b []byte) {
 
 	})
 
 	one := func(n int) {
 		c, err := Dial("tcp", addr)
 		if err != nil {
-			log.Fatalf("Dial failed: %v", err)
+			log.Panicf("Dial failed: %v", err)
 		}
 		g.AddConn(c)
 		if n%2 == 0 {
-			c.Write(make([]byte, msgSize))
-		} else {
 			c.Writev([][]byte{make([]byte, msgSize)})
+		} else {
+			c.Write(make([]byte, msgSize))
 		}
 	}
 
@@ -103,79 +123,33 @@ func TestEcho(t *testing.T) {
 	<-done
 }
 
-func Test10k(t *testing.T) {
-	g := NewGopher(Config{NPoller: 2})
-	err := g.Start()
-	if err != nil {
-		log.Fatalf("Start failed: %v\n", err)
-	}
-	defer g.Stop()
-
-	var total int64 = 0
-	var clientNum int64 = 1024 * 10
-	var done = make(chan int)
-
-	if runtime.GOOS != "linux" {
-		clientNum = 100
-	}
-
-	t.Log("testing concurrent:", clientNum, "connections")
-
-	g.OnOpen(func(c *Conn) {
-		c.Close()
-		c.Write([]byte{1})
-		if atomic.AddInt64(&total, 1) == clientNum {
-			close(done)
-		}
-	})
-
-	one := func() {
-		c, err := Dial("tcp", addr)
-		if err != nil {
-			log.Fatalf("Dial failed: %v", err)
-		}
-		g.AddConn(c)
-	}
-	go func() {
-		for i := 0; i < int(clientNum); i++ {
-			if runtime.GOOS == "linux" {
-				one()
-			} else {
-				go one()
-			}
-		}
-	}()
-
-	<-done
-}
-
 func TestTimeout(t *testing.T) {
 	g := NewGopher(Config{})
 	err := g.Start()
 	if err != nil {
-		log.Fatalf("Start failed: %v\n", err)
+		log.Panicf("Start failed: %v\n", err)
 	}
 	defer g.Stop()
 
 	var done = make(chan int)
 	var begin time.Time
-	var timeout = time.Second / 10
+	var timeout = time.Second
 	g.OnOpen(func(c *Conn) {
 		begin = time.Now()
 		c.SetReadDeadline(begin.Add(timeout))
 	})
 	g.OnClose(func(c *Conn, err error) {
 		to := time.Since(begin)
-		if to > timeout+time.Second/5 {
-			log.Fatalf("timeout: %v, want: %v", to, timeout)
+		if to > timeout*2 {
+			log.Panicf("timeout: %v, want: %v", to, timeout)
 		}
 		close(done)
 	})
 
 	one := func() {
-		c, err := Dial("tcp", addr)
+		c, err := DialTimeout("tcp", addr, time.Second)
 		if err != nil {
-			log.Fatalf("Dial failed: %v", err)
+			log.Panicf("Dial failed: %v", err)
 		}
 		g.AddConn(c)
 	}
@@ -184,129 +158,7 @@ func TestTimeout(t *testing.T) {
 	<-done
 }
 
-func TestHeapTimer(t *testing.T) {
-	g := NewGopher(Config{})
-	g.Start()
-	defer g.Stop()
-
-	timeout := time.Second / 10
-
-	testHeapTimerNormal(g, t, timeout)
-	testHeapTimerExecPanic(g, t, timeout)
-	testHeapTimerNormalExecMany(g, t, timeout)
-	testHeapTimerExecManyRandtime(g, t, timeout)
-}
-
-func testHeapTimerNormal(g *Gopher, t *testing.T, timeout time.Duration) {
-	t1 := time.Now()
-	ch1 := make(chan int)
-	g.AfterFunc(timeout*5, func() {
-		close(ch1)
-	})
-	<-ch1
-	to1 := time.Since(t1)
-	if to1 < timeout*4 || to1 > timeout*10 {
-		log.Fatalf("invalid to1: %v", to1)
-	}
-
-	t2 := time.Now()
-	ch2 := make(chan int)
-	it2 := g.afterFunc(timeout, func() {
-		close(ch2)
-	})
-	it2.Reset(timeout * 5)
-	<-ch2
-	to2 := time.Since(t2)
-	if to2 < timeout*4 || to2 > timeout*10 {
-		log.Fatalf("invalid to2: %v", to2)
-	}
-
-	ch3 := make(chan int)
-	it3 := g.afterFunc(timeout, func() {
-		close(ch3)
-	})
-	it3.Stop()
-	<-g.After(timeout * 2)
-	select {
-	case <-ch3:
-		log.Fatalf("stop failed")
-	default:
-	}
-}
-
-func testHeapTimerExecPanic(g *Gopher, t *testing.T, timeout time.Duration) {
-	g.afterFunc(timeout, func() {
-		panic("test")
-	})
-}
-
-func testHeapTimerNormalExecMany(g *Gopher, t *testing.T, timeout time.Duration) {
-	ch4 := make(chan int, 5)
-	for i := 0; i < 5; i++ {
-		n := i + 1
-		if n == 3 {
-			n = 5
-		} else if n == 5 {
-			n = 3
-		}
-
-		g.afterFunc(timeout*time.Duration(n), func() {
-			ch4 <- n
-		})
-	}
-
-	for i := 0; i < 5; i++ {
-		n := <-ch4
-		if n != i+1 {
-			log.Fatalf("invalid n: %v, %v", i, n)
-		}
-	}
-}
-
-func testHeapTimerExecManyRandtime(g *Gopher, t *testing.T, timeout time.Duration) {
-	its := make([]*htimer, 100)[0:0]
-	ch5 := make(chan int, 100)
-	for i := 0; i < 100; i++ {
-		n := 500 + rand.Int()%200
-		to := time.Duration(n) * time.Second / 1000
-		its = append(its, g.afterFunc(to, func() {
-			ch5 <- n
-		}))
-	}
-	if len(its) != 100 || g.timers.Len() != 100 {
-		log.Fatalf("invalid timers length: %v, %v", len(its), g.timers.Len())
-	}
-	for i := 0; i < 50; i++ {
-		if its[0] == nil {
-			log.Fatalf("invalid its[0]")
-		}
-		its[0].Stop()
-		its = its[1:]
-	}
-	if len(its) != 50 || g.timers.Len() != 50 {
-		log.Fatalf("invalid timers length: %v, %v", len(its), g.timers.Len())
-	}
-	recved := 0
-LOOP_RECV:
-	for {
-		select {
-		case <-ch5:
-			recved++
-		case <-time.After(time.Second):
-			break LOOP_RECV
-		}
-	}
-	if recved != 50 {
-		log.Fatalf("invalid recved num: %v", recved)
-	}
-
-	it := &htimer{parent: g, index: -1}
-	it.Stop()
-}
-
 func TestFuzz(t *testing.T) {
-	maxLoad := gopher.maxLoad
-	gopher.maxLoad = 10
 	wg := sync.WaitGroup{}
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
@@ -315,7 +167,7 @@ func TestFuzz(t *testing.T) {
 			if idx%2 == 0 {
 				Dial("tcp4", addr)
 			} else {
-				Dial("tcp6", addr)
+				Dial("tcp4", addr)
 			}
 		}(i)
 	}
@@ -334,13 +186,12 @@ func TestFuzz(t *testing.T) {
 	})
 	err := g.Start()
 	if err != nil {
-		log.Fatalf("Start failed: %v", err)
+		log.Panicf("Start failed: %v", err)
 	}
 
-	gopher.maxLoad = maxLoad
 	c, err := Dial("tcp", addr)
 	if err == nil {
-		log.Printf("Dial tcp6: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
+		log.Printf("Dial tcp4: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 		g.AddConn(c)
 		c.SetWriteDeadline(time.Now().Add(time.Second))
 		c.Write([]byte{1})
@@ -358,17 +209,214 @@ func TestFuzz(t *testing.T) {
 		c.Close()
 		c.Write([]byte{1})
 	} else {
-		log.Fatalf("Dial tcp6: %v", err)
+		log.Panicf("Dial tcp4: %v", err)
 	}
 
 	gErr := NewGopher(Config{
 		Network: "tcp4",
-		Addrs:   []string{"localhost:8889", "localhost:8889"},
+		Addrs:   []string{"127.0.0.1:8889", "127.0.0.1:8889"},
 	})
 	gErr.Start()
 }
 
+func TestHeapTimer(t *testing.T) {
+	g := NewGopher(Config{})
+	g.Start()
+	defer g.Stop()
+
+	timeout := time.Second / 10
+
+	testHeapTimerNormal(g, timeout)
+	testHeapTimerExecPanic(g, timeout)
+	testHeapTimerNormalExecMany(g, timeout)
+	testHeapTimerExecManyRandtime(g)
+}
+
+func testHeapTimerNormal(g *Gopher, timeout time.Duration) {
+	t1 := time.Now()
+	ch1 := make(chan int)
+	g.AfterFunc(timeout*5, func() {
+		close(ch1)
+	})
+	<-ch1
+	to1 := time.Since(t1)
+	if to1 < timeout*4 || to1 > timeout*10 {
+		log.Panicf("invalid to1: %v", to1)
+	}
+
+	t2 := time.Now()
+	ch2 := make(chan int)
+	it2 := g.afterFunc(timeout, func() {
+		close(ch2)
+	})
+	it2.Reset(timeout * 5)
+	<-ch2
+	to2 := time.Since(t2)
+	if to2 < timeout*4 || to2 > timeout*10 {
+		log.Panicf("invalid to2: %v", to2)
+	}
+
+	ch3 := make(chan int)
+	it3 := g.afterFunc(timeout, func() {
+		close(ch3)
+	})
+	it3.Stop()
+	<-g.After(timeout * 2)
+	select {
+	case <-ch3:
+		log.Panicf("stop failed")
+	default:
+	}
+}
+
+func testHeapTimerExecPanic(g *Gopher, timeout time.Duration) {
+	g.afterFunc(timeout, func() {
+		panic("test")
+	})
+}
+
+func testHeapTimerNormalExecMany(g *Gopher, timeout time.Duration) {
+	ch4 := make(chan int, 5)
+	for i := 0; i < 5; i++ {
+		n := i + 1
+		if n == 3 {
+			n = 5
+		} else if n == 5 {
+			n = 3
+		}
+
+		g.afterFunc(timeout*time.Duration(n), func() {
+			ch4 <- n
+		})
+	}
+
+	for i := 0; i < 5; i++ {
+		n := <-ch4
+		if n != i+1 {
+			log.Panicf("invalid n: %v, %v", i, n)
+		}
+	}
+}
+
+func testHeapTimerExecManyRandtime(g *Gopher) {
+	its := make([]*htimer, 100)[0:0]
+	ch5 := make(chan int, 100)
+	for i := 0; i < 100; i++ {
+		n := 500 + rand.Int()%200
+		to := time.Duration(n) * time.Second / 1000
+		its = append(its, g.afterFunc(to, func() {
+			ch5 <- n
+		}))
+	}
+	if len(its) != 100 || g.timers.Len() != 100 {
+		log.Panicf("invalid timers length: %v, %v", len(its), g.timers.Len())
+	}
+	for i := 0; i < 50; i++ {
+		if its[0] == nil {
+			log.Panicf("invalid its[0]")
+		}
+		its[0].Stop()
+		its = its[1:]
+	}
+	if len(its) != 50 || g.timers.Len() != 50 {
+		log.Panicf("invalid timers length: %v, %v", len(its), g.timers.Len())
+	}
+	recved := 0
+LOOP_RECV:
+	for {
+		select {
+		case <-ch5:
+			recved++
+		case <-time.After(time.Second):
+			break LOOP_RECV
+		}
+	}
+	if recved != 50 {
+		log.Panicf("invalid recved num: %v", recved)
+	}
+
+	it := &htimer{parent: g, index: -1}
+	it.Stop()
+}
+
 func TestStop(t *testing.T) {
-	log.Println(gopher.State().String())
 	gopher.Stop()
+	os.Remove(testfile)
+}
+
+func TestSimple(t *testing.T) {
+	ch := make(chan int)
+	g := NewGopher(Config{
+		Network: "tcp",
+		Addrs:   []string{"0.0.0.0:2333"},
+		NPoller: 10,
+	})
+	g.BeforeRead(func(c *Conn) {
+		fmt.Println("BeforeRead 调用")
+	})
+	g.AfterRead(func(c *Conn) {
+		fmt.Println("AfterRead 调用")
+	})
+	// echo
+	g.OnData(func(c *Conn, data []byte) {
+		time.Sleep(time.Second * 30)
+		c.Write(append([]byte{}, data...))
+	})
+
+	err := g.Start()
+	if err != nil {
+		panic(err)
+	}
+	<-ch
+}
+
+type Client struct {
+	number int
+	mu     sync.Mutex
+}
+
+var client Client
+
+func TestClose(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(10000)
+	g := NewGopher(Config{
+		Network: "tcp",
+		Addrs:   []string{"0.0.0.0:2333"},
+	})
+	mp := make(map[int]int)
+	var mu sync.Mutex
+	// echo
+	g.OnOpen(func(c *Conn) {
+		client.mu.Lock()
+		c.SetSession(client.number)
+		client.number++
+		client.mu.Unlock()
+	})
+	g.OnData(func(c *Conn, data []byte) {
+		number := c.session.(int)
+		mu.Lock()
+		mp[number] += len(data)
+		mu.Unlock()
+		c.Write([]byte{})
+	})
+	g.OnClose(func(c *Conn, err error) {
+		mu.Lock()
+		if mp[c.session.(int)] != 10000 {
+			fmt.Println("wrong", c.session.(int), mp[c.session.(int)])
+		}
+		mu.Unlock()
+		wg.Done()
+	})
+	err := g.Start()
+	if err != nil {
+		panic(err)
+	}
+	wg.Wait()
+	fmt.Println("over")
+	for k, v := range mp {
+		if v != 10000 {
+			fmt.Println("wrong:", k, v)
+		}
+	}
 }

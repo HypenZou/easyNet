@@ -1,3 +1,8 @@
+// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
+//go:build linux || darwin || netbsd || freebsd || openbsd || dragonfly
 // +build linux darwin netbsd freebsd openbsd dragonfly
 
 package easyNet
@@ -8,10 +13,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
+
+	"github.com/wubbalubbaaa/easyNet/mempool"
 )
 
-// Conn implements net.Conn
+// Conn implements net.Conn.
 type Conn struct {
 	mux sync.Mutex
 
@@ -19,13 +25,10 @@ type Conn struct {
 
 	fd int
 
-	// rIndex int
-	// wIndex int
 	rTimer *htimer
 	wTimer *htimer
 
-	leftSize  int
-	sendQueue [][]byte
+	writeBuffer []byte
 
 	closed   bool
 	isWAdded bool
@@ -37,16 +40,22 @@ type Conn struct {
 	ReadBuffer []byte
 
 	session interface{}
+
+	chWaitWrite chan struct{}
+
+	execList []func()
+
+	DataHandler func(c *Conn, data []byte)
 }
 
-// Hash returns a hash code
+// Hash returns a hash code.
 func (c *Conn) Hash() int {
 	return c.fd
 }
 
-// Read implements Read
+// Read implements Read.
 func (c *Conn) Read(b []byte) (int, error) {
-	// use lock to prevent multiple conn data confusion when fd is reused on unix
+	// use lock to prevent multiple conn data confusion when fd is reused on unix.
 	c.mux.Lock()
 	if c.closed {
 		c.mux.Unlock()
@@ -54,7 +63,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 	}
 	c.mux.Unlock()
 
-	n, err := syscall.Read(int(c.fd), b)
+	n, err := syscall.Read(c.fd, b)
 	if err == nil {
 		c.g.afterRead(c)
 	}
@@ -62,9 +71,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// Write implements Write
+// Write implements Write.
 func (c *Conn) Write(b []byte) (int, error) {
-	// use lock to prevent multiple conn data confusion when fd is reused on unix
+	defer c.g.onWriteBufferFree(c, b)
+
 	c.mux.Lock()
 	if c.closed {
 		c.mux.Unlock()
@@ -74,24 +84,18 @@ func (c *Conn) Write(b []byte) (int, error) {
 	c.g.beforeWrite(c)
 
 	n, err := c.write(b)
-	if err != nil && err != syscall.EAGAIN {
+	if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
 		c.mux.Unlock()
-		if c.wTimer != nil {
-			c.wTimer.Stop()
-		}
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		// tw.delete(c, &c.wIndex)
-		c.closeWithErrorWithoutLock(errInvalidData)
+		c.closeWithErrorWithoutLock(err)
 		return n, err
 	}
 
-	if c.leftSize == 0 {
+	if len(c.writeBuffer) == 0 {
 		if c.wTimer != nil {
 			c.wTimer.Stop()
+			c.wTimer = nil
 		}
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		// tw.delete(c, &c.wIndex)
 	} else {
 		c.modWrite()
 	}
@@ -100,34 +104,41 @@ func (c *Conn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Writev implements Writev
+// Writev implements Writev.
 func (c *Conn) Writev(in [][]byte) (int, error) {
+	defer func() {
+		for _, v := range in {
+			c.g.onWriteBufferFree(c, v)
+		}
+	}()
 	c.mux.Lock()
 	if c.closed {
 		c.mux.Unlock()
+
 		return 0, errClosed
 	}
 
 	c.g.beforeWrite(c)
 
-	n, err := c.writev(in)
-	if err != nil && err != syscall.EAGAIN {
+	var n int
+	var err error
+	switch len(in) {
+	case 1:
+		n, err = c.write(in[0])
+	default:
+		n, err = c.writev(in)
+	}
+	if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
 		c.mux.Unlock()
-		if c.wTimer != nil {
-			c.wTimer.Stop()
-		}
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		// tw.delete(c, &c.wIndex)
 		c.closeWithErrorWithoutLock(err)
 		return n, err
 	}
-	if c.leftSize == 0 {
+	if len(c.writeBuffer) == 0 {
 		if c.wTimer != nil {
 			c.wTimer.Stop()
+			c.wTimer = nil
 		}
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		// tw.delete(c, &c.wIndex)
 	} else {
 		c.modWrite()
 	}
@@ -136,94 +147,88 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 	return n, err
 }
 
-// Close implements Close
+// Close implements Close.
 func (c *Conn) Close() error {
-	if c.wTimer != nil {
-		c.wTimer.Stop()
-	}
-	if c.rTimer != nil {
-		c.rTimer.Stop()
-	}
 	return c.closeWithError(nil)
 }
 
-// LocalAddr implements LocalAddr
+// CloseWithError .
+func (c *Conn) CloseWithError(err error) error {
+	return c.closeWithError(err)
+}
+
+// LocalAddr implements LocalAddr.
 func (c *Conn) LocalAddr() net.Addr {
 	return c.lAddr
 }
 
-// RemoteAddr implements RemoteAddr
+// RemoteAddr implements RemoteAddr.
 func (c *Conn) RemoteAddr() net.Addr {
 	return c.rAddr
 }
 
-// SetDeadline implements SetDeadline
+// SetDeadline implements SetDeadline.
 func (c *Conn) SetDeadline(t time.Time) error {
 	c.mux.Lock()
 	if !c.closed {
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twRead
-		// if tw != nil {
-		// 	tw.reset(c, &c.rIndex, t)
-		// }
-		// tw = c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		// if tw != nil {
-		// 	tw.reset(c, &c.wIndex, t)
-		// }
-		now := time.Now()
-		if c.rTimer == nil {
-			c.rTimer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(errReadTimeout) })
+		if !t.IsZero() {
+			now := time.Now()
+			if c.rTimer == nil {
+				c.rTimer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(errReadTimeout) })
+			} else {
+				c.rTimer.Reset(t.Sub(now))
+			}
+			if c.wTimer == nil {
+				c.wTimer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(errWriteTimeout) })
+			} else {
+				c.wTimer.Reset(t.Sub(now))
+			}
 		} else {
-			c.rTimer.Reset(t.Sub(now))
-		}
-		if c.wTimer == nil {
-			c.wTimer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(errWriteTimeout) })
-		} else {
-			c.wTimer.Reset(t.Sub(now))
+			if c.rTimer != nil {
+				c.rTimer.Stop()
+				c.rTimer = nil
+			}
+			if c.wTimer != nil {
+				c.wTimer.Stop()
+				c.wTimer = nil
+			}
 		}
 	}
 	c.mux.Unlock()
 	return nil
 }
 
-// SetReadDeadline implements SetReadDeadline
+func (c *Conn) setDeadline(timer **htimer, returnErr error, t time.Time) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	if c.closed {
+		return nil
+	}
+	if !t.IsZero() {
+		now := time.Now()
+		if *timer == nil {
+			*timer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(returnErr) })
+		} else {
+			(*timer).Reset(t.Sub(now))
+		}
+	} else if *timer != nil {
+		(*timer).Stop()
+		(*timer) = nil
+	}
+	return nil
+}
+
+// SetReadDeadline implements SetReadDeadline.
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	c.mux.Lock()
-	if !c.closed {
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twRead
-		// if tw != nil {
-		// 	tw.reset(c, &c.rIndex, t)
-		// }
-		now := time.Now()
-		if c.rTimer == nil {
-			c.rTimer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(errReadTimeout) })
-		} else {
-			c.rTimer.Reset(t.Sub(now))
-		}
-	}
-	c.mux.Unlock()
-	return nil
+	return c.setDeadline(&c.rTimer, errReadTimeout, t)
 }
 
-// SetWriteDeadline implements SetWriteDeadline
+// SetWriteDeadline implements SetWriteDeadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.mux.Lock()
-	if !c.closed {
-		// tw := c.g.pollers[c.fd%len(c.g.pollers)].twWrite
-		// if tw != nil {
-		// 	tw.reset(c, &c.wIndex, t)
-		// }
-		now := time.Now()
-		if c.wTimer == nil {
-			c.wTimer = c.g.afterFunc(t.Sub(now), func() { c.closeWithError(errWriteTimeout) })
-		} else {
-			c.wTimer.Reset(t.Sub(now))
-		}
-	}
-	c.mux.Unlock()
-	return nil
+	return c.setDeadline(&c.wTimer, errWriteTimeout, t)
 }
 
-// SetNoDelay implements SetNoDelay
+// SetNoDelay implements SetNoDelay.
 func (c *Conn) SetNoDelay(nodelay bool) error {
 	if nodelay {
 		return syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
@@ -231,17 +236,17 @@ func (c *Conn) SetNoDelay(nodelay bool) error {
 	return syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 0)
 }
 
-// SetReadBuffer implements SetReadBuffer
+// SetReadBuffer implements SetReadBuffer.
 func (c *Conn) SetReadBuffer(bytes int) error {
 	return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bytes)
 }
 
-// SetWriteBuffer implements SetWriteBuffer
+// SetWriteBuffer implements SetWriteBuffer.
 func (c *Conn) SetWriteBuffer(bytes int) error {
 	return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bytes)
 }
 
-// SetKeepAlive implements SetKeepAlive
+// SetKeepAlive implements SetKeepAlive.
 func (c *Conn) SetKeepAlive(keepalive bool) error {
 	if keepalive {
 		return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1)
@@ -249,7 +254,7 @@ func (c *Conn) SetKeepAlive(keepalive bool) error {
 	return syscall.SetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 0)
 }
 
-// SetKeepAlivePeriod implements SetKeepAlivePeriod
+// SetKeepAlivePeriod implements SetKeepAlivePeriod.
 func (c *Conn) SetKeepAlivePeriod(d time.Duration) error {
 	return errors.New("not supported")
 	// d += (time.Second - time.Nanosecond)
@@ -260,7 +265,7 @@ func (c *Conn) SetKeepAlivePeriod(d time.Duration) error {
 	// return syscall.SetsockoptInt(c.fd, syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, secs)
 }
 
-// SetLinger implements SetLinger
+// SetLinger implements SetLinger.
 func (c *Conn) SetLinger(onoff int32, linger int32) error {
 	return syscall.SetsockoptLinger(c.fd, syscall.SOL_SOCKET, syscall.SO_LINGER, &syscall.Linger{
 		Onoff:  onoff,  // 1
@@ -268,24 +273,14 @@ func (c *Conn) SetLinger(onoff int32, linger int32) error {
 	})
 }
 
-// Session returns user session
+// Session returns user session.
 func (c *Conn) Session() interface{} {
 	return c.session
 }
 
-// SetSession sets user session
-func (c *Conn) SetSession(session interface{}) bool {
-	if session == nil {
-		return false
-	}
-	c.mux.Lock()
-	if c.session == nil {
-		c.session = session
-		c.mux.Unlock()
-		return true
-	}
-	c.mux.Unlock()
-	return false
+// SetSession sets user session.
+func (c *Conn) SetSession(session interface{}) {
+	c.session = session
 }
 
 func (c *Conn) modWrite() {
@@ -299,7 +294,8 @@ func (c *Conn) resetRead() {
 	if !c.closed && c.isWAdded {
 		c.isWAdded = false
 		p := c.g.pollers[c.Hash()%len(c.g.pollers)]
-		p.deleteWrite(c.fd)
+		p.deleteEvent(c.fd)
+		p.addRead(c.fd)
 	}
 }
 
@@ -312,35 +308,25 @@ func (c *Conn) write(b []byte) (int, error) {
 		return -1, syscall.EINVAL
 	}
 
-	c.leftSize += len(b)
-
-	var (
-		err    error
-		nwrite int
-	)
-
-	if len(c.sendQueue) == 0 {
-		for {
-			n, err := syscall.Write(int(c.fd), b)
-			if n > 0 {
-				nwrite += n
-				c.leftSize -= n
-				if n < len(b) {
-					c.sendQueue = append(c.sendQueue, b[n:])
-					return n, err
-				}
-			}
-			if err == syscall.EINTR {
-				continue
-			}
-
-			break
+	if len(c.writeBuffer) == 0 {
+		n, err := syscall.Write(c.fd, b)
+		if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.EAGAIN) {
+			return n, err
 		}
-	} else {
-		c.sendQueue = append(c.sendQueue, b)
+		if n < 0 {
+			n = 0
+		}
+		left := len(b) - n
+		if left > 0 {
+			c.writeBuffer = mempool.Malloc(left)
+			copy(c.writeBuffer, b[n:])
+			c.modWrite()
+		}
+		return len(b), nil
 	}
+	c.writeBuffer = append(c.writeBuffer, b...)
 
-	return nwrite, err
+	return len(b), nil
 }
 
 func (c *Conn) flush() error {
@@ -350,123 +336,90 @@ func (c *Conn) flush() error {
 		return errClosed
 	}
 
-	var err error
-	var sendQ = c.sendQueue
-	c.leftSize = 0
-	c.sendQueue = nil
-	if len(sendQ) == 1 {
-		_, err = c.write(sendQ[0])
-	} else {
-		_, err = c.writev(sendQ)
+	if len(c.writeBuffer) == 0 {
+		c.mux.Unlock()
+		return nil
 	}
-	if err != nil && err != syscall.EAGAIN && err != syscall.EINTR {
+
+	old := c.writeBuffer
+
+	n, err := syscall.Write(c.fd, old)
+	if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
 		c.mux.Unlock()
 		c.closeWithErrorWithoutLock(err)
 		return err
 	}
-	if c.leftSize == 0 {
+	if n < 0 {
+		n = 0
+	}
+	left := len(old) - n
+	if left > 0 {
+		if n > 0 {
+			c.writeBuffer = mempool.Malloc(left)
+			copy(c.writeBuffer, old[n:])
+			mempool.Free(old)
+		}
+		// c.modWrite()
+	} else {
+		c.writeBuffer = nil
 		if c.wTimer != nil {
 			c.wTimer.Stop()
+			c.wTimer = nil
 		}
 		c.resetRead()
-		// p := c.g.pollers[c.fd%len(c.g.pollers)]
-		// p.twWrite.delete(c, &c.wIndex)
+		if c.chWaitWrite != nil {
+			select {
+			case c.chWaitWrite <- struct{}{}:
+			default:
+			}
+		}
 	}
-	// else {
-	// c.modWrite()
-	// }
 
 	c.mux.Unlock()
-	return err
+	return nil
 }
 
 func (c *Conn) writev(in [][]byte) (int, error) {
-	if len(c.sendQueue) == 0 {
-		return c.writevToSocket(in)
+	size := 0
+	for _, v := range in {
+		size += len(v)
 	}
-	return c.writeToSendQueue(in)
-}
+	if c.overflow(size) {
+		return -1, syscall.EINVAL
+	}
+	if len(c.writeBuffer) > 0 {
+		for _, v := range in {
+			c.writeBuffer = append(c.writeBuffer, v...)
+		}
+		return size, nil
+	}
 
-func (c *Conn) writeToSendQueue(in [][]byte) (int, error) {
-	var ntotal int
+	if len(in) > 1 && size <= 65536 {
+		b := mempool.Malloc(size)
+		copied := 0
+		for _, v := range in {
+			copy(b[copied:], v)
+			copied += len(v)
+		}
+		return c.write(b)
+	}
+
+	nwrite := 0
 	for _, b := range in {
-		if len(b) == 0 {
-			return -1, errInvalidData
+		n, err := c.write(b)
+		if n > 0 {
+			nwrite += n
 		}
-		ntotal += len(b)
-	}
-
-	if ntotal == 0 {
-		return 0, nil
-	}
-
-	if c.overflow(ntotal) {
-		return -1, syscall.EINVAL
-	}
-
-	c.leftSize += ntotal
-	c.sendQueue = append(c.sendQueue, in...)
-
-	return 0, nil
-}
-
-func (c *Conn) writevToSocket(in [][]byte) (int, error) {
-	var (
-		err    error
-		ntotal int
-		nwrite int
-		iovec  = make([]syscall.Iovec, len(in))
-	)
-
-	for i, slice := range in {
-		ntotal += len(slice)
-		iovec[i] = syscall.Iovec{Base: &slice[0], Len: uint64(len(slice))}
-	}
-
-	if ntotal == 0 {
-		return 0, nil
-	}
-
-	if c.overflow(ntotal) {
-		return -1, syscall.EINVAL
-	}
-
-	c.leftSize += ntotal
-
-	nwRaw, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(c.fd), uintptr(unsafe.Pointer(&iovec[0])), uintptr(len(iovec)))
-	if errno != 0 {
-		err = syscall.Errno(errno)
-	}
-	nwrite = int(nwRaw)
-	if nwrite > 0 {
-		c.leftSize -= nwrite
-		if nwrite < ntotal {
-			for i := 0; i < len(in); i++ {
-				if len(in[i]) < nwrite {
-					nwrite -= len(in[i])
-				} else if len(in[i]) == nwrite {
-					in = in[i+1:]
-					iovec = iovec[i+1:]
-					iovec[0] = syscall.Iovec{Base: &(in[0][0]), Len: uint64(len(in[0]))}
-					break
-				} else {
-					in[i] = in[i][nwrite:]
-					in = in[i:]
-					iovec = iovec[i:]
-					iovec[0] = syscall.Iovec{Base: &(in[0][0]), Len: uint64(len(in[0]))}
-					break
-				}
-			}
-			c.sendQueue = append(c.sendQueue, in...)
+		if err != nil {
+			return nwrite, err
 		}
 	}
-
-	return int(nwRaw), err
+	return nwrite, nil
 }
 
 func (c *Conn) overflow(n int) bool {
-	return c.g.maxWriteBufferSize > 0 && (c.leftSize+n > int(c.g.maxWriteBufferSize))
+	return c.g.maxWriteBufferSize > 0 && (len(c.writeBuffer)+n > c.g.maxWriteBufferSize)
 }
 
 func (c *Conn) closeWithError(err error) error {
@@ -481,91 +434,46 @@ func (c *Conn) closeWithError(err error) error {
 }
 
 func (c *Conn) closeWithErrorWithoutLock(err error) error {
-	fd := c.fd
-	c.session = nil
 	c.closeErr = err
+
+	if c.wTimer != nil {
+		c.wTimer.Stop()
+		c.wTimer = nil
+	}
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+
+	mempool.Free(c.writeBuffer)
+	c.writeBuffer = nil
+
+	if c.chWaitWrite != nil {
+		select {
+		case c.chWaitWrite <- struct{}{}:
+		default:
+		}
+	}
+
 	if c.g != nil {
 		c.g.pollers[c.Hash()%len(c.g.pollers)].deleteConn(c)
 	}
 
-	return syscall.Close(fd)
+	return syscall.Close(c.fd)
 }
 
-func dupStdConn(conn net.Conn) (*Conn, error) {
-	sc, ok := conn.(interface {
-		SyscallConn() (syscall.RawConn, error)
-	})
+// NBConn converts net.Conn to *Conn.
+func NBConn(conn net.Conn) (*Conn, error) {
+	if conn == nil {
+		return nil, errors.New("invalid conn: nil")
+	}
+	c, ok := conn.(*Conn)
 	if !ok {
-		return nil, errors.New("RawConn Unsupported")
+		var err error
+		c, err = dupStdConn(conn)
+		if err != nil {
+			return nil, err
+		}
 	}
-	rc, err := sc.SyscallConn()
-	if err != nil {
-		return nil, errors.New("RawConn Unsupported")
-	}
-
-	var newFd int
-	errCtrl := rc.Control(func(fd uintptr) {
-		newFd, err = syscall.Dup(int(fd))
-	})
-
-	if errCtrl != nil {
-		return nil, errCtrl
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	err = syscall.SetNonblock(newFd, true)
-	if err != nil {
-		syscall.Close(newFd)
-		return nil, err
-	}
-
-	return &Conn{
-		fd:    newFd,
-		lAddr: conn.LocalAddr(),
-		rAddr: conn.RemoteAddr(),
-	}, nil
-}
-
-func newConn(fd int, lAddr, rAddr net.Addr) *Conn {
-	return &Conn{
-		fd:    fd,
-		lAddr: lAddr,
-		rAddr: rAddr,
-	}
-}
-
-// Dial wraps syscall.Connect
-func Dial(network string, address string) (*Conn, error) {
-	sa, _, err := getSockaddr(network, address)
-	if err != nil {
-		return nil, err
-	}
-
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
-	if err != nil {
-		return nil, err
-	}
-
-	err = syscall.Connect(fd, sa)
-	if err != nil {
-		return nil, err
-	}
-
-	err = syscall.SetNonblock(fd, true)
-	if err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	la, err := syscall.Getsockname(fd)
-	if err != nil {
-		return nil, err
-	}
-
-	c := newConn(fd, sockaddrToAddr(la), sockaddrToAddr(sa))
-
 	return c, nil
 }

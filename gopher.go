@@ -1,29 +1,40 @@
+// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
 package easyNet
 
 import (
 	"container/heap"
-	"fmt"
 	"net"
-	"runtime/debug"
+	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
+	"unsafe"
 
-	"github.com/wubbalubbaaa/easyNet/log"
+	"github.com/wubbalubbaaa/easyNet/logging"
 )
 
 const (
-	// DefaultMaxLoad .
-	DefaultMaxLoad uint32 = 1024 * 100
-
 	// DefaultReadBufferSize .
-	DefaultReadBufferSize uint32 = 1024 * 16
+	DefaultReadBufferSize = 1024 * 32
 
 	// DefaultMaxWriteBufferSize .
-	DefaultMaxWriteBufferSize uint32 = 1024 * 1024
+	DefaultMaxWriteBufferSize = 1024 * 1024
+
+	// DefaultMaxReadTimesPerEventLoop .
+	DefaultMaxReadTimesPerEventLoop = 3
+
+	// DefaultMinConnCacheSize .
+	DefaultMinConnCacheSize = 1024 * 2
 )
 
-// Config Of Gopher
+var (
+	// MaxOpenFiles .
+	MaxOpenFiles = 1024 * 1024
+)
+
+// Config Of Gopher.
 type Config struct {
 	// Name describes your gopher name for logging, it's set to "NB" by default.
 	Name string
@@ -37,48 +48,40 @@ type Config struct {
 	// if it is empty, no listener created, then the Gopher is used for client by default.
 	Addrs []string
 
-	// MaxLoad decides the max online num, it's set to 10k by default.
-	MaxLoad uint32
+	// NPoller represents poller goroutine num, it's set to runtime.NumCPU() by default.
+	NPoller int
 
-	// NListener decides the listener goroutine num on *nix, it's set to 1 by default.
-	NListener uint32
+	// NListener represents poller goroutine num, it's set to runtime.NumCPU() by default.
+	NListener int
 
-	// NPoller decides poller goroutine num, it's set to runtime.NumCPU() by default.
-	NPoller uint32
+	// Backlog represents backlog arg for syscall.Listen
+	Backlog int
 
-	// ReadBufferSize decides buffer size for reading, it's set to 16k by default.
-	ReadBufferSize uint32
+	// ReadBufferSize represents buffer size for reading, it's set to 16k by default.
+	ReadBufferSize int
 
-	// MaxWriteBufferSize decides max write buffer size for Conn, it's set to 1m by default.
+	// MinConnCacheSize represents application layer's Conn write cache buffer size when the kernel sendQ is full
+	MinConnCacheSize int
+
+	// MaxWriteBufferSize represents max write buffer size for Conn, it's set to 1m by default.
 	// if the connection's Send-Q is full and the data cached by easyNet is
 	// more than MaxWriteBufferSize, the connection would be closed by easyNet.
-	MaxWriteBufferSize uint32
+	MaxWriteBufferSize int
 
-	// LockThread decides poller's goroutine to lock thread or not, it's set to false by default.
-	LockThread bool
+	// MaxReadTimesPerEventLoop represents max read times in one poller loop for one fd
+	MaxReadTimesPerEventLoop int
+
+	// LockListener represents listener's goroutine to lock thread or not, it's set to false by default.
+	LockListener bool
+
+	// LockPoller represents poller's goroutine to lock thread or not, it's set to false by default.
+	LockPoller bool
+
+	// EpollMod sets the epoll mod, EPOLLLT by default.
+	EpollMod int
 }
 
-// State of Gopher
-type State struct {
-	// Name .
-	Name string
-	// Online .
-	Online int
-	// Pollers .
-	Pollers []struct{ Online int }
-}
-
-// String returns Gopher's State Info
-func (state *State) String() string {
-	// str := fmt.Sprintf("****************************************\n[%v]:\n", time.Now().Format("2006.01.02 15:04:05"))
-	str := fmt.Sprintf("Gopher[%v] Total Online: %v\n", state.Name, state.Online)
-	for i := 0; i < len(state.Pollers); i++ {
-		str += fmt.Sprintf("  Poller[%v] Online: %v\n", i, state.Pollers[i].Online)
-	}
-	return str
-}
-
-// Gopher is a manager of poller
+// Gopher is a manager of poller.
 type Gopher struct {
 	sync.WaitGroup
 	mux  sync.Mutex
@@ -86,17 +89,19 @@ type Gopher struct {
 
 	Name string
 
-	network            string
-	addrs              []string
-	listenerNum        uint32
-	pollerNum          uint32
-	readBufferSize     uint32
-	maxWriteBufferSize uint32
-	lockThread         bool
+	network                  string
+	addrs                    []string
+	pollerNum                int
+	backlogSize              int
+	readBufferSize           int
+	maxWriteBufferSize       int
+	maxReadTimesPerEventLoop int
+	minConnCacheSize         int
+	epollMod                 int
+	lockListener             bool
+	lockPoller               bool
 
-	lfds     []int
-	currLoad int64
-	maxLoad  int64
+	lfds []int
 
 	connsStd  map[*Conn]struct{}
 	connsUnix []*Conn
@@ -104,37 +109,44 @@ type Gopher struct {
 	listeners []*poller
 	pollers   []*poller
 
-	onOpen      func(c *Conn)
-	onClose     func(c *Conn, err error)
-	onRead      func(c *Conn, b []byte) ([]byte, error)
-	onData      func(c *Conn, data []byte)
-	onMemAlloc  func(c *Conn) []byte
-	onMemFree   func(c *Conn, buffer []byte)
-	beforeRead  func(c *Conn)
-	afterRead   func(c *Conn)
-	beforeWrite func(c *Conn)
+	onOpen            func(c *Conn)
+	onClose           func(c *Conn, err error)
+	onRead            func(c *Conn)
+	onData            func(c *Conn, data []byte)
+	onReadBufferAlloc func(c *Conn) []byte
+	onReadBufferFree  func(c *Conn, buffer []byte)
+	onWriteBufferFree func(c *Conn, buffer []byte)
+	beforeRead        func(c *Conn)
+	afterRead         func(c *Conn)
+	beforeWrite       func(c *Conn)
+	onStop            func()
 
-	timers  timerHeap
-	trigger *time.Timer
-	chTimer chan struct{}
+	callings  []func()
+	chCalling chan struct{}
+	timers    timerHeap
+	trigger   *time.Timer
+	chTimer   chan struct{}
+
+	Execute func(f func())
 }
 
-// Stop pollers
+// Stop pollers.
 func (g *Gopher) Stop() {
+	g.onStop()
+
 	g.trigger.Stop()
 	close(g.chTimer)
 
-	for i := uint32(0); i < g.listenerNum; i++ {
-		g.listeners[i].stop()
+	for _, l := range g.listeners {
+		l.stop()
 	}
-	for i := uint32(0); i < g.pollerNum; i++ {
+	for i := 0; i < g.pollerNum; i++ {
 		g.pollers[i].stop()
 	}
 	g.mux.Lock()
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
-	g.connsUnix = make([]*Conn, len(connsUnix))
 	g.mux.Unlock()
 
 	for c := range conns {
@@ -149,25 +161,20 @@ func (g *Gopher) Stop() {
 	}
 
 	g.Wait()
+	logging.Info("Gopher[%v] stop", g.Name)
 }
 
-// AddConn adds conn to a poller
+// AddConn adds conn to a poller.
 func (g *Gopher) AddConn(conn net.Conn) (*Conn, error) {
-	c, err := g.Conn(conn)
+	c, err := NBConn(conn)
 	if err != nil {
 		return nil, err
 	}
-	g.increase()
-	g.pollers[uint32(c.Hash())%g.pollerNum].addConn(c)
+	g.pollers[uint32(c.Hash())%uint32(g.pollerNum)].addConn(c)
 	return c, nil
 }
 
-// Online returns Gopher's total online
-func (g *Gopher) Online() int64 {
-	return atomic.LoadInt64(&g.currLoad)
-}
-
-// OnOpen registers callback for new connection
+// OnOpen registers callback for new connection.
 func (g *Gopher) OnOpen(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid nil handler")
@@ -175,24 +182,24 @@ func (g *Gopher) OnOpen(h func(c *Conn)) {
 	g.onOpen = h
 }
 
-// OnClose registers callback for disconnected
+// OnClose registers callback for disconnected.
 func (g *Gopher) OnClose(h func(c *Conn, err error)) {
 	if h == nil {
 		panic("invalid nil handler")
 	}
-	g.onClose = h
+	g.onClose = func(c *Conn, err error) {
+		g.atOnce(func() {
+			h(c, err)
+		})
+	}
 }
 
-// OnRead registers callback for read
-func (g *Gopher) OnRead(h func(c *Conn, b []byte) ([]byte, error)) {
-	if h == nil {
-		panic("invalid nil handler")
-	}
-	// log.Info("---- set OnRead: %v", h)
+// OnRead registers callback for reading event.
+func (g *Gopher) OnRead(h func(c *Conn)) {
 	g.onRead = h
 }
 
-// OnData registers callback for data
+// OnData registers callback for data.
 func (g *Gopher) OnData(h func(c *Conn, data []byte)) {
 	if h == nil {
 		panic("invalid nil handler")
@@ -200,24 +207,32 @@ func (g *Gopher) OnData(h func(c *Conn, data []byte)) {
 	g.onData = h
 }
 
-// OnMemAlloc registers callback for memory allocating
-func (g *Gopher) OnMemAlloc(h func(c *Conn) []byte) {
+// OnReadBufferAlloc registers callback for memory allocating.
+func (g *Gopher) OnReadBufferAlloc(h func(c *Conn) []byte) {
 	if h == nil {
 		panic("invalid nil handler")
 	}
-	g.onMemAlloc = h
+	g.onReadBufferAlloc = h
 }
 
-// OnMemFree registers callback for memory release
-func (g *Gopher) OnMemFree(h func(c *Conn, b []byte)) {
+// OnReadBufferFree registers callback for memory release.
+func (g *Gopher) OnReadBufferFree(h func(c *Conn, b []byte)) {
 	if h == nil {
 		panic("invalid nil handler")
 	}
-	g.onMemFree = h
+	g.onReadBufferFree = h
+}
+
+// OnWriteBufferRelease registers callback for write buffer memory release.
+func (g *Gopher) OnWriteBufferRelease(h func(c *Conn, b []byte)) {
+	if h == nil {
+		panic("invalid nil handler")
+	}
+	g.onWriteBufferFree = h
 }
 
 // BeforeRead registers callback before syscall.Read
-// the handler would be called on windows
+// the handler would be called only on windows.
 func (g *Gopher) BeforeRead(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid nil handler")
@@ -226,7 +241,7 @@ func (g *Gopher) BeforeRead(h func(c *Conn)) {
 }
 
 // AfterRead registers callback after syscall.Read
-// the handler would be called on *nix
+// the handler would be called only on *nix.
 func (g *Gopher) AfterRead(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid nil handler")
@@ -235,7 +250,6 @@ func (g *Gopher) AfterRead(h func(c *Conn)) {
 }
 
 // BeforeWrite registers callback befor syscall.Write and syscall.Writev
-// the handler would be called on windows
 func (g *Gopher) BeforeWrite(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid nil handler")
@@ -243,22 +257,15 @@ func (g *Gopher) BeforeWrite(h func(c *Conn)) {
 	g.beforeWrite = h
 }
 
-// State returns Gopher's state info
-func (g *Gopher) State() *State {
-	state := &State{
-		Name:    g.Name,
-		Online:  int(g.Online()),
-		Pollers: make([]struct{ Online int }, len(g.pollers)),
+// OnStop registers callback before Gopher is stopped.
+func (g *Gopher) OnStop(h func()) {
+	if h == nil {
+		panic("invalid nil handler")
 	}
-
-	for i := 0; i < len(g.pollers); i++ {
-		state.Pollers[i].Online = int(g.pollers[i].online())
-	}
-
-	return state
+	g.onStop = h
 }
 
-// After used as time.After
+// After used as time.After.
 func (g *Gopher) After(timeout time.Duration) <-chan time.Time {
 	c := make(chan time.Time, 1)
 	g.afterFunc(timeout, func() {
@@ -267,10 +274,22 @@ func (g *Gopher) After(timeout time.Duration) <-chan time.Time {
 	return c
 }
 
-// AfterFunc used as time.AfterFunc
+// AfterFunc used as time.AfterFunc.
 func (g *Gopher) AfterFunc(timeout time.Duration, f func()) *Timer {
 	ht := g.afterFunc(timeout, f)
 	return &Timer{htimer: ht}
+}
+
+func (g *Gopher) atOnce(f func()) {
+	if f != nil {
+		g.tmux.Lock()
+		g.callings = append(g.callings, f)
+		g.tmux.Unlock()
+		select {
+		case g.chCalling <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (g *Gopher) afterFunc(timeout time.Duration, f func()) *htimer {
@@ -305,7 +324,8 @@ func (g *Gopher) removeTimer(it *htimer) {
 		heap.Remove(&g.timers, index)
 		if len(g.timers) > 0 {
 			if index == 0 {
-				g.trigger.Reset(g.timers[0].expire.Sub(time.Now()))
+				g.trigger.Reset(time.Until(g.timers[0].expire))
+
 			}
 		} else {
 			g.trigger.Reset(timeForever)
@@ -313,7 +333,7 @@ func (g *Gopher) removeTimer(it *htimer) {
 	}
 }
 
-// ResetTimer removes a timer
+// ResetTimer removes a timer.
 func (g *Gopher) resetTimer(it *htimer) {
 	g.tmux.Lock()
 	defer g.tmux.Unlock()
@@ -326,40 +346,66 @@ func (g *Gopher) resetTimer(it *htimer) {
 	if g.timers[index] == it {
 		heap.Fix(&g.timers, index)
 		if index == 0 || it.index == 0 {
-			g.trigger.Reset(g.timers[0].expire.Sub(time.Now()))
+			g.trigger.Reset(time.Until(g.timers[0].expire))
 		}
 	}
 }
 
 func (g *Gopher) timerLoop() {
 	defer g.Done()
-	log.Debug("Gopher[%v] timer start", g.Name)
-	defer log.Debug("Gopher[%v] timer stopped", g.Name)
+	logging.Debug("Gopher[%v] timer start", g.Name)
+	defer logging.Debug("Gopher[%v] timer stopped", g.Name)
 	for {
 		select {
+		case <-g.chCalling:
+			for {
+				g.tmux.Lock()
+				if len(g.callings) == 0 {
+					g.callings = nil
+					g.tmux.Unlock()
+					break
+				}
+				f := g.callings[0]
+				g.callings = g.callings[1:]
+				g.tmux.Unlock()
+				func() {
+					defer func() {
+						err := recover()
+						if err != nil {
+							const size = 64 << 10
+							buf := make([]byte, size)
+							buf = buf[:runtime.Stack(buf, false)]
+							logging.Error("Gopher[%v] exec call failed: %v\n%v\n", g.Name, err, *(*string)(unsafe.Pointer(&buf)))
+						}
+					}()
+					f()
+				}()
+			}
 		case <-g.trigger.C:
 			for {
 				g.tmux.Lock()
 				if g.timers.Len() == 0 {
+					g.trigger.Reset(timeForever)
 					g.tmux.Unlock()
 					break
 				}
 				now := time.Now()
 				it := g.timers[0]
 				if now.After(it.expire) {
-					heap.Pop(&g.timers)
+					heap.Remove(&g.timers, it.index)
 					g.tmux.Unlock()
 					func() {
 						defer func() {
 							err := recover()
 							if err != nil {
-								log.Error("Gopher[%v] exec timer failed: %v", g.Name, err)
-								debug.PrintStack()
+								const size = 64 << 10
+								buf := make([]byte, size)
+								buf = buf[:runtime.Stack(buf, false)]
+								logging.Error("Gopher[%v] exec timer failed: %v\n%v\n", g.Name, err, *(*string)(unsafe.Pointer(&buf)))
 							}
 						}()
 						it.f()
 					}()
-
 				} else {
 					g.trigger.Reset(it.expire.Sub(now))
 					g.tmux.Unlock()
@@ -372,41 +418,41 @@ func (g *Gopher) timerLoop() {
 	}
 }
 
-// PollerBuffer returns Poller's buffer by Conn, can be used on linux/bsd
+// PollerBuffer returns Poller's buffer by Conn, can be used on linux/bsd.
 func (g *Gopher) PollerBuffer(c *Conn) []byte {
-	return g.pollers[uint32(c.Hash())%g.pollerNum].ReadBuffer
+	return g.pollers[uint32(c.Hash())%uint32(g.pollerNum)].ReadBuffer
 }
 
 func (g *Gopher) initHandlers() {
 	g.OnOpen(func(c *Conn) {})
 	g.OnClose(func(c *Conn, err error) {})
-	g.OnRead(func(c *Conn, b []byte) ([]byte, error) {
-		n, err := c.Read(b)
-		if err != nil {
-			return nil, err
-		}
-		return b[:n], err
-	})
+	// g.OnRead(func(c *Conn, b []byte) ([]byte, error) {
+	// 	n, err := c.Read(b)
+	// 	if n > 0 {
+	// 		return b[:n], err
+	// 	}
+	// 	return nil, err
+	// })
 	g.OnData(func(c *Conn, data []byte) {})
-	g.OnMemAlloc(g.PollerBuffer)
-	g.OnMemFree(func(c *Conn, buffer []byte) {})
+	g.OnReadBufferAlloc(g.PollerBuffer)
+	g.OnReadBufferFree(func(c *Conn, buffer []byte) {})
+	g.OnWriteBufferRelease(func(c *Conn, buffer []byte) {})
 	g.BeforeRead(func(c *Conn) {})
 	g.AfterRead(func(c *Conn) {})
 	g.BeforeWrite(func(c *Conn) {})
+	g.OnStop(func() {})
+
+	if g.Execute == nil {
+		g.Execute = func(f func()) {
+			f()
+		}
+	}
 }
 
 func (g *Gopher) borrow(c *Conn) []byte {
-	return g.onMemAlloc(c)
+	return g.onReadBufferAlloc(c)
 }
 
 func (g *Gopher) payback(c *Conn, buffer []byte) {
-	g.onMemFree(c, buffer)
-}
-
-func (g *Gopher) increase() {
-	atomic.AddInt64(&g.currLoad, 1)
-}
-
-func (g *Gopher) decrease() {
-	atomic.AddInt64(&g.currLoad, -1)
+	g.onReadBufferFree(c, buffer)
 }

@@ -1,15 +1,18 @@
+// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
+//go:build windows
 // +build windows
 
 package easyNet
 
 import (
-	"errors"
-	"net"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/wubbalubbaaa/easyNet/log"
+	"github.com/wubbalubbaaa/easyNet/logging"
 )
 
 // Start init and start pollers
@@ -29,7 +32,7 @@ func (g *Gopher) Start() error {
 		}
 	}
 
-	for i := uint32(0); i < g.pollerNum; i++ {
+	for i := 0; i < g.pollerNum; i++ {
 		g.pollers[i], err = newPoller(g, false, int(i))
 		if err != nil {
 			for j := 0; j < len(g.addrs); j++ {
@@ -43,7 +46,7 @@ func (g *Gopher) Start() error {
 		}
 	}
 
-	for i := uint32(0); i < g.pollerNum; i++ {
+	for i := 0; i < g.pollerNum; i++ {
 		g.Add(1)
 		go g.pollers[i].start()
 	}
@@ -56,63 +59,51 @@ func (g *Gopher) Start() error {
 	go g.timerLoop()
 
 	if len(g.addrs) == 0 {
-		log.Info("Gopher[%v] start", g.Name)
+		logging.Info("Gopher[%v] start", g.Name)
 	} else {
-		log.Info("Gopher[%v] start listen on: [\"%v\"]", g.Name, strings.Join(g.addrs, `", "`))
+		logging.Info("Gopher[%v] start listen on: [\"%v\"]", g.Name, strings.Join(g.addrs, `", "`))
 	}
 	return nil
 }
 
-// Conn converts net.Conn to *Conn
-func (g *Gopher) Conn(conn net.Conn) (*Conn, error) {
-	if conn == nil {
-		return nil, errors.New("invalid conn: nil")
-	}
-	c, ok := conn.(*Conn)
-	if !ok {
-		c = newConn(conn, true)
-	}
-	return c, nil
-}
-
 // NewGopher is a factory impl
 func NewGopher(conf Config) *Gopher {
-	cpuNum := uint32(runtime.NumCPU())
+	cpuNum := runtime.NumCPU()
 	if conf.Name == "" {
 		conf.Name = "NB"
 	}
-	if conf.MaxLoad == 0 {
-		conf.MaxLoad = DefaultMaxLoad
-	}
-	if len(conf.Addrs) > 0 && conf.NListener == 0 {
-		conf.NListener = 1
-	}
-	if conf.NPoller == 0 {
+	if conf.NPoller <= 0 {
 		conf.NPoller = cpuNum
 	}
-	if conf.ReadBufferSize == 0 {
+	if conf.ReadBufferSize <= 0 {
 		conf.ReadBufferSize = DefaultReadBufferSize
+	}
+	if conf.MinConnCacheSize == 0 {
+		conf.MinConnCacheSize = DefaultMinConnCacheSize
 	}
 
 	g := &Gopher{
 		Name:               conf.Name,
 		network:            conf.Network,
 		addrs:              conf.Addrs,
-		maxLoad:            int64(conf.MaxLoad),
-		listenerNum:        conf.NListener,
 		pollerNum:          conf.NPoller,
 		readBufferSize:     conf.ReadBufferSize,
 		maxWriteBufferSize: conf.MaxWriteBufferSize,
-		listeners:          make([]*poller, conf.NListener),
+		minConnCacheSize:   conf.MinConnCacheSize,
+		lockListener:       conf.LockListener,
+		lockPoller:         conf.LockPoller,
+		listeners:          make([]*poller, len(conf.Addrs)),
 		pollers:            make([]*poller, conf.NPoller),
 		connsStd:           map[*Conn]struct{}{},
+		callings:           []func(){},
+		chCalling:          make(chan struct{}, 1),
 		trigger:            time.NewTimer(timeForever),
 		chTimer:            make(chan struct{}),
 	}
 
 	g.initHandlers()
 
-	g.OnMemAlloc(func(c *Conn) []byte {
+	g.OnReadBufferAlloc(func(c *Conn) []byte {
 		if c.ReadBuffer == nil {
 			c.ReadBuffer = make([]byte, int(g.readBufferSize))
 		}

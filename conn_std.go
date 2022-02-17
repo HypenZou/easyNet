@@ -1,8 +1,16 @@
+// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
+
+//go:build windows
 // +build windows
 
 package easyNet
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -25,6 +33,12 @@ type Conn struct {
 
 	// user session
 	session interface{}
+
+	execList []func()
+
+	cache *bytes.Buffer
+
+	DataHandler func(c *Conn, data []byte)
 }
 
 // Hash returns a hashcode
@@ -34,10 +48,38 @@ func (c *Conn) Hash() int {
 
 // Read wraps net.Conn.Read
 func (c *Conn) Read(b []byte) (int, error) {
+	if c.closeErr != nil {
+		return 0, c.closeErr
+	}
+
+	var reader io.Reader = c.conn
+	if c.cache != nil {
+		reader = c.cache
+	}
+	nread, err := reader.Read(b)
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
+	return nread, err
+}
+
+func (c *Conn) read(b []byte) (int, error) {
 	c.g.beforeRead(c)
 	nread, err := c.conn.Read(b)
 	if c.closeErr == nil {
 		c.closeErr = err
+	}
+	if c.g.onRead != nil {
+		if nread > 0 {
+			if c.cache == nil {
+				c.cache = bytes.NewBuffer(nil)
+			}
+			c.cache.Write(b[:nread])
+		}
+		c.g.onRead(c)
+		return nread, nil
+	} else if nread > 0 {
+		c.g.onData(c, b[:nread])
 	}
 	return nread, err
 }
@@ -53,6 +95,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		}
 		c.Close()
 	}
+	c.g.onWriteBufferFree(c, b)
 
 	return nwrite, err
 }
@@ -66,6 +109,9 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 			c.closeErr = err
 		}
 		c.Close()
+	}
+	for _, v := range in {
+		c.g.onWriteBufferFree(c, v)
 	}
 	return int(nwrite), err
 }
@@ -86,6 +132,14 @@ func (c *Conn) Close() error {
 	return nil
 }
 
+// CloseWithError .
+func (c *Conn) CloseWithError(err error) error {
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
+	return c.Close()
+}
+
 // LocalAddr wraps net.Conn.LocalAddr
 func (c *Conn) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
@@ -98,16 +152,25 @@ func (c *Conn) RemoteAddr() net.Addr {
 
 // SetDeadline wraps net.Conn.SetDeadline
 func (c *Conn) SetDeadline(t time.Time) error {
+	if t.IsZero() {
+		t = time.Now().Add(timeForever)
+	}
 	return c.conn.SetDeadline(t)
 }
 
 // SetReadDeadline wraps net.Conn.SetReadDeadline
 func (c *Conn) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		t = time.Now().Add(timeForever)
+	}
 	return c.conn.SetReadDeadline(t)
 }
 
 // SetWriteDeadline wraps net.Conn.SetWriteDeadline
 func (c *Conn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		t = time.Now().Add(timeForever)
+	}
 	return c.conn.SetWriteDeadline(t)
 }
 
@@ -171,18 +234,8 @@ func (c *Conn) Session() interface{} {
 }
 
 // SetSession sets user session
-func (c *Conn) SetSession(session interface{}) bool {
-	if session == nil {
-		return false
-	}
-	c.mux.Lock()
-	if c.session == nil {
-		c.session = session
-		c.mux.Unlock()
-		return true
-	}
-	c.mux.Unlock()
-	return false
+func (c *Conn) SetSession(session interface{}) {
+	c.session = session
 }
 
 func newConn(conn net.Conn, fromClient ...interface{}) *Conn {
@@ -204,24 +257,14 @@ func newConn(conn net.Conn, fromClient ...interface{}) *Conn {
 	return c
 }
 
-// Dial wraps net.Dial
-func Dial(network string, address string) (*Conn, error) {
-	conn, err := net.Dial(network, address)
-	if err != nil {
-		return nil, err
+// NBConn converts net.Conn to *Conn
+func NBConn(conn net.Conn) (*Conn, error) {
+	if conn == nil {
+		return nil, errors.New("invalid conn: nil")
 	}
-
-	c := &Conn{
-		conn: conn,
+	c, ok := conn.(*Conn)
+	if !ok {
+		c = newConn(conn, true)
 	}
-
-	addr := conn.LocalAddr().String()
-	for _, ch := range addr {
-		c.hash = 31*c.hash + int(ch)
-	}
-	if c.hash < 0 {
-		c.hash = -c.hash
-	}
-
 	return c, nil
 }

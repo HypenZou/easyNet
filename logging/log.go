@@ -1,8 +1,8 @@
-// Copyright 2020 wubbalubbaaa. All rights reserved.
+// Copyright 2020 lesismal. All rights reserved.
 // Use of this source code is governed by an MIT-style
 // license that can be found in the LICENSE file.
 
-package log
+package logging
 
 import (
 	"fmt"
@@ -17,7 +17,7 @@ var (
 	// Output is used to receive log output.
 	Output = os.Stdout
 
-	// DefaultLogger is the default logger and is used by arpc
+	// DefaultLogger is the default logger and is used by arpc.
 	DefaultLogger Logger = &logger{level: LevelInfo}
 )
 
@@ -36,7 +36,7 @@ const (
 	LevelNone
 )
 
-// Logger defines log interface
+// Logger defines log interface.
 type Logger interface {
 	SetLevel(lvl int)
 	Debug(format string, v ...interface{})
@@ -55,7 +55,6 @@ func SetLevel(lvl int) {
 	switch lvl {
 	case LevelAll, LevelDebug, LevelInfo, LevelWarn, LevelError, LevelNone:
 		DefaultLogger.SetLevel(lvl)
-		break
 	default:
 		fmt.Fprintf(Output, "invalid log level: %v", lvl)
 	}
@@ -71,7 +70,6 @@ func (l *logger) SetLevel(lvl int) {
 	switch lvl {
 	case LevelAll, LevelDebug, LevelInfo, LevelWarn, LevelError, LevelNone:
 		l.level = lvl
-		break
 	default:
 		fmt.Fprintf(Output, "invalid log level: %v", lvl)
 	}
