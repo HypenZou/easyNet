@@ -9,7 +9,11 @@ import (
 )
 
 var (
-	errClosed       = errors.New("conn closed")
-	errReadTimeout  = errors.New("read timeout")
-	errWriteTimeout = errors.New("write timeout")
+	errClosed             = errors.New("conn closed")
+	errReadTimeout        = errors.New("read timeout")
+	errWriteTimeout       = errors.New("write timeout")
+	errInvalidFixedLength = errors.New("invalid fixed length")
+	errUnexpectedEOF      = errors.New("unexpected EOF error")
+	errTooLessLength      = errors.New("too less length")
+	errUnsupportedLength  = errors.New("unsupported length")
 )

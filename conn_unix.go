@@ -45,6 +45,10 @@ type Conn struct {
 
 	execList []func()
 
+	codec ICodec
+
+	CacheBuffer []byte
+
 	DataHandler func(c *Conn, data []byte)
 }
 
@@ -303,7 +307,6 @@ func (c *Conn) write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-
 	if c.overflow(len(b)) {
 		return -1, syscall.EINVAL
 	}
@@ -462,6 +465,10 @@ func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	return syscall.Close(c.fd)
 }
 
+func (c *Conn) SetCodec(codec ICodec) {
+	c.codec = codec
+}
+
 // NBConn converts net.Conn to *Conn.
 func NBConn(conn net.Conn) (*Conn, error) {
 	if conn == nil {
@@ -476,4 +483,18 @@ func NBConn(conn net.Conn) (*Conn, error) {
 		}
 	}
 	return c, nil
+}
+
+func (c *Conn) Cache() *[]byte {
+	return &c.CacheBuffer
+}
+
+func (c *Conn) handlerProtocol(buf []byte) {
+	cache := &c.CacheBuffer
+	*cache = append(*cache, buf...)
+	frame, err := c.codec.Decode(c)
+	for err == nil && len(frame) != 0 {
+		c.g.onData(c, frame)
+		frame, err = c.codec.Decode(c)
+	}
 }

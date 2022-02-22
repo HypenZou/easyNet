@@ -183,7 +183,11 @@ func (p *poller) readWriteLoop() {
 								buffer := p.g.borrow(c)
 								n, err := c.Read(buffer)
 								if n > 0 {
-									p.g.onData(c, buffer[:n])
+									if c.codec == nil {
+										p.g.onData(c, buffer[:n])
+									} else {
+										c.handlerProtocol(buffer[:n])
+									}
 								}
 								p.g.payback(c, buffer)
 								if errors.Is(err, syscall.EINTR) {
